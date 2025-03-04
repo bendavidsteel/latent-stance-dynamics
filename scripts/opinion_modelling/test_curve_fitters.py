@@ -68,8 +68,7 @@ def plot_spline(
     train_y=None,
     plot_observed_data=False,
     plot_predictions=False,
-    n_prior_samples=0,
-    n_test=10,
+    n_test=100,
     ax=None,
 ):
 
