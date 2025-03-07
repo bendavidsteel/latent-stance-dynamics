@@ -46,9 +46,10 @@ def plot_gp(
             end_x = max_x + 0.1 * (max_x - min_x)
             test_x = torch.linspace(start_x, end_x, n_test).to('cuda')
             test_classifier_ids = torch.zeros(n_test, dtype=torch.long)
+            model = model.cuda()
             model_pred = model(test_x)
-            # likelihood.set_classifier_ids(test_classifier_ids)
-            # observed_pred = likelihood(model_pred)
+            likelihood.set_classifier_ids(test_classifier_ids)
+            observed_pred = likelihood(model_pred)
             # Get upper and lower confidence bounds
             lower, upper = model_pred.confidence_region()
             # Plot predictive means as blue line
@@ -109,15 +110,6 @@ def main():
 
     model_type = 'gp'
     if model_type == 'gp':
-        model_list, likelihood_list, model_map, train_xs, train_ys = get_gp_models(
-            X_norm, 
-            y, 
-            classifier_ids, 
-            all_classifier_profiles, 
-            lengthscale_loc=lengthscale_loc, 
-            lengthscale_scale=lengthscale_scale,
-            gp_type='ordinal'
-        )
 
         # get some samples from the untrained models
         # fig, ax = plt.subplots(1, 1, figsize=(4, 3))
@@ -128,10 +120,11 @@ def main():
         #     plot(model, likelihood, train_x=X_norm[i,:], train_y=y[i,:,k], plot_observed_data=True, plot_predictions=True, ax=ax)
         # plt.show()
         
-        models, likelihood_list, model_map, losses = train_gaussian_process(
+        model_list, likelihood_list, model_map, losses = train_gaussian_process(
             X_norm, 
             y, 
             classifier_ids, 
+            dataset.stance_columns,
             all_classifier_profiles, 
             lengthscale_loc=lengthscale_loc, 
             lengthscale_scale=lengthscale_scale,
@@ -143,7 +136,7 @@ def main():
 
     # get some samples from the untrained models
     fig, ax = plt.subplots(1, 1, figsize=(4, 3))
-    for idx in range(min(3, len(models))):
+    for idx in range(min(3, len(model_list))):
         if model_type == 'gp':
             i, k = model_map[idx]
             model = model_list[idx]
