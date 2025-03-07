@@ -125,7 +125,7 @@ def main():
     all_classifier_profiles = dataset.all_classifier_profiles
     stance_targets = dataset.stance_columns
     stance_names = ['Vaccine Mandates', 'Renter Protections', 'NDP', 'Liberals', 'Conservatives', 'Gun Control', 'Drug Decriminalization', 'Liberal Immigration Policy', 'Canadian Aid to Ukraine']
-    X_norm, X, y, classifier_ids = prep_gp_data(dataset)
+    X_norm, X, y, users, classifier_ids = prep_gp_data(dataset)
 
     model_type = 'spline'
     if model_type == 'gp':
@@ -148,6 +148,19 @@ def main():
     np.save(os.path.join(root_dir_path, "data", data_source, source_dir, model_type, "timestamps.npy"), timestamps)
     np.save(os.path.join(root_dir_path, "data", data_source, source_dir, model_type, "means.npy"), means)
     np.save(os.path.join(root_dir_path, "data", data_source, source_dir, model_type, "confidence_region.npy"), confidence_region)
+
+    if users['subreddit'].nunique() > 0:
+        subreddits = users['subreddit'].unique()
+        for subreddit in subreddits:
+            os.makedirs(os.path.join(root_dir_path, "data", data_source, source_dir, model_type, subreddit), exist_ok=True)
+            subreddit_users = users[users['subreddit'] == subreddit]
+            subreddit_user_idxs = subreddit_users.index
+            subreddit_timestamps = timestamps[subreddit_user_idxs]
+            subreddit_means = means[subreddit_user_idxs]
+            subreddit_confidence_region = confidence_region[subreddit_user_idxs]
+            np.save(os.path.join(root_dir_path, "data", data_source, source_dir, model_type, subreddit, "timestamps.npy"), subreddit_timestamps)
+            np.save(os.path.join(root_dir_path, "data", data_source, source_dir, model_type, subreddit, "means.npy"), subreddit_means)
+            np.save(os.path.join(root_dir_path, "data", data_source, source_dir, model_type, subreddit, "confidence_region.npy"), subreddit_confidence_region)
 
     os.makedirs(os.path.join(root_dir_path, "figs", data_source, source_dir, model_type, "model_fits"), exist_ok=True)
     user_is = sorted(list(set([i for i, k in model_map])))

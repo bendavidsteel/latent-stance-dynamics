@@ -107,7 +107,7 @@ def main():
     lengthscale_loc = time_span_ratio * 0.01
     lengthscale_scale = time_span_ratio * 0.1
 
-    model_type = 'spline'
+    model_type = 'gp'
     if model_type == 'gp':
         model_list, likelihood_list, model_map, train_xs, train_ys = get_gp_models(
             X_norm, 
