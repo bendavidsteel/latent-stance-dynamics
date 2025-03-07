@@ -24,6 +24,7 @@ def plot_gp(
     train_y=None,
     plot_observed_data=False,
     plot_predictions=False,
+    plot_likelihood=False,
     n_prior_samples=0,
     n_test=10,
     ax=None,
@@ -34,7 +35,12 @@ def plot_gp(
 
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
         # Initialize plot
-        f, ax = plt.subplots(1, 1, figsize=(4, 3))
+        if not plot_likelihood:
+            f, ax = plt.subplots(1, 1, figsize=(4, 3))
+        else:
+            f, axes = plt.subplots(1, 2, figsize=(8, 3))
+            ax = axes[0]
+            ax_likelihood = axes[1]
 
         if plot_observed_data:
             # Plot training data as black stars
@@ -47,9 +53,9 @@ def plot_gp(
             test_x = torch.linspace(start_x, end_x, n_test).to('cuda')
             test_classifier_ids = torch.zeros(n_test, dtype=torch.long)
             model = model.cuda()
-            model_pred = model(test_x)
-            likelihood.set_classifier_ids(test_classifier_ids)
-            observed_pred = likelihood(model_pred)
+            model_pred = model.predict(test_x)
+            # likelihood.set_classifier_ids(test_classifier_ids)
+            
             # Get upper and lower confidence bounds
             lower, upper = model_pred.confidence_region()
             # Plot predictive means as blue line
@@ -59,7 +65,14 @@ def plot_gp(
             # upper = get_expected_class(upper.T)
             # Shade between the lower and upper confidence bounds
             ax.fill_between(test_x.cpu().numpy(), lower.cpu().numpy(), upper.cpu().numpy(), alpha=0.5)
-        ax.set_ylim([-3, 3])
+        if plot_likelihood:
+            ax_likelihood.plot(train_x.numpy(), train_y.numpy(), 'k*')
+            model_pred = model(test_x)
+            observed_pred = likelihood(model_pred) # returns samples that are run through the likelihood
+            # average over samples
+            ax_likelihood.matshow(observed_pred.probs.mean(0).cpu().numpy().T, aspect='auto', extent=(train_x.numpy().min(), train_x.numpy().max(), -1.5, 1.5), origin='lower')
+
+        ax.set_ylim([-1.5, 1.5])
         ax.legend(['Observed Data', 'Mean', 'Confidence'])
 
 def plot_spline(
@@ -105,8 +118,8 @@ def main():
     all_classifier_profiles = dataset.all_classifier_profiles
 
     time_span_ratio = (torch.max(X) - torch.min(X)) / (torch.max(X_norm) - torch.min(X_norm))
-    lengthscale_loc = time_span_ratio * 0.01
-    lengthscale_scale = time_span_ratio * 0.1
+    lengthscale_loc = time_span_ratio * 1.0
+    lengthscale_scale = time_span_ratio * 1.0
 
     model_type = 'gp'
     if model_type == 'gp':
@@ -141,7 +154,7 @@ def main():
             i, k = model_map[idx]
             model = model_list[idx]
             likelihood = likelihood_list[idx]
-            plot_gp(model, likelihood, train_x=X_norm[i,:], train_y=y[i,:,k], plot_observed_data=True, plot_predictions=True, ax=ax)
+            plot_gp(model, likelihood, train_x=X_norm[i,:], train_y=y[i,:,k], plot_observed_data=True, plot_predictions=True, plot_likelihood=True, ax=ax)
         elif model_type == 'spline':
             i, k = model_map[idx]
             # model = model_list[idx]
