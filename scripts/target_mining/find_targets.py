@@ -62,13 +62,13 @@ def main():
         'verbose': True
     }
 
-    target_df = target_df.filter(pl.col('createtime') > pl.lit('2024-12-1').str.to_datetime().dt.convert_time_zone('UTC'))
+    target_df = target_df.filter(pl.col('createtime') > pl.lit('2022-1-1').str.to_datetime().dt.convert_time_zone('UTC'))
 
     target_df = target_df.with_columns(stancemining.utils.filter_stance_targets(pl.col('Targets')))
 
     doc_target_df = model.fit_transform(target_df, embedding_cache=unique_target_df, bertopic_kwargs=bertopic_kwargs)
     target_info = model.get_target_info()
-    doc_target_df.write_parquet('./data/stance_targets/1month_doc_targets.parquet.zstd', compression='zstd')
+    doc_target_df.write_parquet('./data/stance_targets/3year_doc_targets.parquet.zstd', compression='zstd')
 
 if __name__ == '__main__':
     main()
