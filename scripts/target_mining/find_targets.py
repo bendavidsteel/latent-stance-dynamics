@@ -1,47 +1,67 @@
+import datetime
+import logging
 import os
+import re
 
+import hydra
+import numpy as np
 import polars as pl
+from tqdm import tqdm
+import torch
+import transformers
 
-import stancemining
+from stancemining.main import StanceMining
+from stancemining.utils import remove_bad_targets
 
-def main():
-    # load base targets from twitter, instagram and tiktok
-    tiktok_target_df = pl.read_parquet('./data/tiktok/stance_targets/targets.parquet.zstd')
-    tiktok_target_df = tiktok_target_df.with_columns([pl.col('text').alias('Document'), pl.col('createtime').str.to_datetime().dt.convert_time_zone('UTC')])
-    # twitter_target_dir = './data/twitter/stance_targets'
-    # twitter_target_df = pl.DataFrame()
-    # for filename in os.listdir(twitter_target_dir):
-    #     if filename.startswith('targets') and filename.endswith('.parquet.zstd'):
-    #         twitter_target_file_df = pl.read_parquet(f'{twitter_target_dir}/{filename}')
-    #         twitter_target_df = pl.concat([twitter_target_df, twitter_target_file_df], how='diagonal_relaxed')
-    twitter_target_df = pl.read_parquet('./data/twitter/stance_targets/targets.parquet.zstd')
-    twitter_target_df = twitter_target_df.with_columns([pl.col('rawContent').alias('Document'), pl.col('date').str.to_datetime().alias('createtime')])
-    # instagram_target_dir = './data/instagram/stance_targets'
-    # instagram_target_df = pl.DataFrame()
-    # for filename in os.listdir(instagram_target_dir):
-    #     if filename.startswith('targets') and filename.endswith('.parquet.zstd'):
-    #         instagram_target_file_df = pl.read_parquet(f'{instagram_target_dir}/{filename}')
-    #         instagram_target_df = pl.concat([instagram_target_df, instagram_target_file_df], how='diagonal_relaxed')
-    instagram_target_df = pl.read_parquet('./data/instagram/stance_targets/targets.parquet.zstd')
-    instagram_target_df = instagram_target_df.with_columns([pl.col('raw_caption').alias('Document'), pl.from_epoch(pl.col('taken_at')).dt.convert_time_zone('UTC').alias('createtime')])
-    target_df = pl.concat([tiktok_target_df, twitter_target_df, instagram_target_df], how='diagonal_relaxed')
+def get_raw_file(filename, platform):
+    raw_path = '~/repos/sitrep/data/digital_trace/raw_platforms'
+    year, month, day = filename.split('.')[0].split('_')[1:]
+    date_str = datetime.date(int(year), int(month), int(day)).strftime('%Y-%m-%d')
+    raw_filename = f"{platform}_{date_str}.parquet.zstd"
+    raw_day_df = pl.read_parquet(os.path.join(raw_path, raw_filename))
+    return raw_day_df
 
-    finetune_kwargs = {
-        'model_name': 'HuggingFaceTB/SmolLM2-360M-Instruct',
-        'add_system_message': True,
-        'save_model_path': '../stancemining/models/stancemining',
-        'prompting_method': 'stancemining',
-        'classification_method': 'generation',
-        'generation_method': 'list',
-        'batch_size': 64
-    }
 
-    model = stancemining.StanceMining(
-        model_name='microsoft/Phi-4-mini-instruct',
-        model_kwargs={'device_map': 'auto', 'trust_remote_code': True, 'torch_dtype': 'auto'},
-        finetune_kwargs=finetune_kwargs,
-        get_stance=False,
-        verbose=True
+def remove_doc_bad_targets(df: pl.DataFrame):
+    df = df.with_row_index()
+    target_df = df.select(['index', 'Targets']).explode('Targets').rename({'Targets': 'Target'})
+    target_df = remove_bad_targets(target_df)
+    target_df = target_df.group_by('index').agg(pl.col('Target')).rename({'Target': 'Targets'})
+    df = df.drop('Targets').join(target_df, on='index', how='left').with_columns(pl.col('Targets').fill_null([]))
+    df = df.drop('index')
+    return df
+
+@hydra.main(version_base=None, config_path="../../config", config_name="config")
+def main(config):
+    logger = logging.getLogger('find_targets')
+
+    pl.set_random_seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    
+    target_dir = config.base_target_path
+    target_df = pl.DataFrame()
+    for filename in tqdm(os.listdir(target_dir), desc='Loading files...'):
+        if re.match('targets_\d{4}_\d{1,2}_\d{1,2}.parquet.zstd', filename):
+            target_file_df = pl.read_parquet(f'{target_dir}/{filename}')
+            target_df = pl.concat([target_df, target_file_df], how='diagonal_relaxed')
+    
+    logger.info(f'Loaded {target_df.shape[0]} targets from {len(os.listdir(target_dir))} files.')
+
+    target_df = target_df.unique(['id', 'platform'])
+
+    target_df = target_df.filter(pl.col('createtime') >= datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc))
+
+    # remove bad targets
+    target_df = remove_doc_bad_targets(target_df)
+
+    logger.info(f'After removing bad targets, {target_df.shape[0]} targets remain.')
+
+    model = StanceMining(
+        model_name='Qwen/Qwen3-4B',
+        stance_target_type=config.stance_target_type,
+        topic_model='bertopic',
+        verbose=True,
     )
 
     target_path = './data/stance_targets/unique_targets.parquet.zstd'
@@ -57,18 +77,37 @@ def main():
         unique_target_df = pl.read_parquet(target_path)
     unique_target_df = unique_target_df.rename({'Targets': 'text', 'embeddings': 'embedding'})
 
-    bertopic_kwargs = {
-        'min_topic_size': 50,
-        'verbose': True
+    toponymy_kwargs = {
+        'clusterer': {
+            'base_min_cluster_size': 20
+        }
     }
 
-    target_df = target_df.filter(pl.col('createtime') > pl.lit('2022-1-1').str.to_datetime().dt.convert_time_zone('UTC'))
+    logger.info('Fitting model...')
 
-    target_df = target_df.with_columns(stancemining.utils.filter_stance_targets(pl.col('Targets')))
+    doc_target_df = model.fit_transform(
+        target_df, 
+        get_stance=False, 
+        dbscan_deduplicate=False,
+        embedding_cache=unique_target_df, 
+        # topic_model_kwargs=toponymy_kwargs,
+        text_column='Document',
+        parent_text_column='ParentDocument',
+        max_layers=2
+    )
+    target_info_df = model.get_target_info()
 
-    doc_target_df = model.fit_transform(target_df, embedding_cache=unique_target_df, bertopic_kwargs=bertopic_kwargs)
-    target_info = model.get_target_info()
-    doc_target_df.write_parquet('./data/stance_targets/3year_doc_targets.parquet.zstd', compression='zstd')
+    logger.info(f'Finished fitting model with {len(target_info_df)} targets.')
+
+    period = '2025-01-onwards'
+    doc_target_df.write_parquet(f'./data/stance_targets/{period}_doc_targets.parquet.zstd', compression='zstd')
+
+    logger.info(f'Saving target info to {period}_target_info.parquet.zstd')
+    target_info_df.write_parquet(f'./data/stance_targets/{period}_target_info.parquet.zstd', compression='zstd')
+    logger.info("Successfully saved target info.")
+
+    topic_model = model.get_topic_model()
+    topic_model.save(f"./data/stance_targets/{period}_topic_model.pickle", serialization="pickle")
 
 if __name__ == '__main__':
     main()
