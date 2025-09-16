@@ -4,13 +4,13 @@ import os
 import re
 
 import dotenv
-import numpy as np
 import polars as pl
 import requests
-from torch import multiprocessing
-from tqdm import tqdm
-import wandb
+import hydra
+
 from stancemining.estimate import infer_stance_trends_for_target, _get_classifier_profiles
+
+from deduplicate_targets import remove_bad_targets
 
 def get_session(base_url, username, password):
     res = requests.post(f"{base_url}/meologin", params={"username": username, "password": password}, verify=True)
@@ -28,16 +28,14 @@ def get_seedlist(base_url, headers):
     else:
         return None
 
-def process_data():
+def process_data(config):
     """Load and process the main data from files using efficient Polars operations"""
     print("Loading and processing data files...")
-    # Load data with fewer columns
-    dir_path = './data/stance_targets/doc_stance'
     
     # Collect all file paths first, then read them in a single operation
     file_paths = [
-        os.path.join(dir_path, file) 
-        for file in os.listdir(dir_path)
+        os.path.join(config.base_stance_path, file) 
+        for file in os.listdir(config.base_stance_path)
         if re.search(r'\d{4}_\d{1,2}_doc_targets_with_stance.parquet.zstd', file)
     ]
     
@@ -55,11 +53,12 @@ def process_data():
     df = pl.concat(dfs, how='diagonal_relaxed')
 
     df = df.unique(['id', 'platform'])
-    
-    # Filter for consistent list lengths, then explode
+
     df = df.explode(['Targets', 'Stances'])\
         .rename({'Targets': 'Target', 'Stances': 'Stance'})
     df = df.drop_nulls('Target')
+
+    df = remove_bad_targets(df)
     
     df = df.with_columns(pl.col('seed').struct.unnest())
 
@@ -79,23 +78,21 @@ def remove_low_count_targets(df, target_count_df, min_count):
 
 
 
-def precompute_trends_for_all_targets(df, target_count_df):
+def precompute_trends_for_all_targets(config, df, target_count_df):
     """Precompute trend data for all targets with optimized batch processing"""
 
-    classifier_profiles = _get_classifier_profiles('bendavidsteel/SmolLM2-135M-Instruct-stance-detection')
+    classifier_profiles = _get_classifier_profiles('bendavidsteel/SmolLM2-360M-Instruct-stance-detection')
     
-    filter_columns = ['platform', 'PlatformHandleID']
-
-    dir_path = './data/stance_targets/target_trends'
+    filter_columns = ['platform', 'PlatformHandleID', 'SeedName']
 
     for target in target_count_df.to_dicts():
         target_name = target['Target']
-        target_slug = target_name.lower().replace(' ', '_').replace('-', '_').replace("'", '').replace('"', '')
-        trend_path = f'{dir_path}/{target_slug}_trends.parquet.zstd'
-        gp_path = f'{dir_path}/{target_slug}_gp.parquet.zstd'
-        # if os.path.exists(trend_path) and os.path.exists(gp_path):
-        #     print(f"Skipping {target_name}, trends already computed.")
-        #     continue
+        target_slug = target_name.lower().replace(' ', '_').replace('-', '_').replace("'", '').replace('"', '').replace('/', '_')
+        trend_path = f'{config.trend_path}/{target_slug}_trends.parquet.zstd'
+        gp_path = f'{config.trend_path}/{target_slug}_gp.parquet.zstd'
+        if os.path.exists(trend_path) and os.path.exists(gp_path):
+            print(f"Skipping {target_name}, trends already computed.")
+            continue
 
         print(f"Processing primary target: {target_name}")
             
@@ -104,6 +101,7 @@ def precompute_trends_for_all_targets(df, target_count_df):
             df,
             target_name,
             filter_columns=filter_columns,
+            interpolation_method='lowess',
             time_column='createtime',
             classifier_profiles=classifier_profiles,
             min_filter_count=20,
@@ -178,36 +176,24 @@ def calculate_stance_statistics(df, valid_targets: pl.DataFrame):
     
     return target_stats_df
 
-def main():
+
+@hydra.main(version_base=None, config_path="../../config", config_name="config")
+def main(config):
     print("Starting precomputation process...")
     
     # Process the data
-    df, target_count_df = process_data()
+    df, target_count_df = process_data(config)
     print(f"Processed data for {len(target_count_df)} targets")
 
     # remove targets with low counts
     df, target_count_df = remove_low_count_targets(df, target_count_df, 50)
 
-    # target_count_df = target_count_df.filter(pl.col('Target').str.contains_any([
-    #     'israel', 
-    #     'gaza', 
-    #     'ukraine', 
-    #     'russia', 
-    #     'china', 
-    #     'carbon tax', 
-    #     'immigration',
-    #     'trudeau',
-    #     'carney',
-    #     'poilievre',
-    #     'trump',
-    #     'liberal',
-    #     'conservative',
-    #     'ndp',
-    #     'taiwan'
-    # ]))
+    # target_count_df = target_count_df.filter(pl.col('Target') == 'good morning is a greeting.')
+
+    os.makedirs(config.trend_path, exist_ok=True)
 
     # Precompute trend data for primary targets only (grouped)
-    precompute_trends_for_all_targets(df, target_count_df)
+    precompute_trends_for_all_targets(config, df, target_count_df)
     
     print("Precomputation complete!")
 

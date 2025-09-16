@@ -72,7 +72,7 @@ def save_stance(batch_week_df: pl.DataFrame, miner: StanceMining, week_batch_pat
 
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(config):
-    document_df = pl.read_parquet(f'./data/stance_targets/all_doc_targets.parquet.zstd')
+    document_df = pl.read_parquet(f'./data/stance_targets/2024-06-01-onwards_doc_targets.parquet.zstd')
     document_df = document_df.select(['id', 'Document', 'ParentDocument', 'createtime', 'seed', 'Targets', 'finetune_kwargs', 'platform'])
 
     # truncate text for now
@@ -80,9 +80,8 @@ def main(config):
     document_df = document_df.with_columns((pl.col('Document').str.len_chars().fill_null(0) + pl.col('ParentDocument').str.len_chars().fill_null(0)).alias('text_len'))\
         .filter(pl.col('text_len') < 8500).drop('text_len')
 
-    miner = StanceMining(
-        verbose=True
-    )
+    # TODO train gemma3 sequence classification when this is in transformers release that vllm supports: https://github.com/huggingface/transformers/pull/39465
+    miner = StanceMining(verbose=True)
     # batch out calls
     week_df = document_df.select([pl.col('createtime').dt.year().alias('year'), pl.col('createtime').dt.week().alias('week')]).unique().sort(['year', 'week'], descending=True)
     for week in week_df.to_dicts():

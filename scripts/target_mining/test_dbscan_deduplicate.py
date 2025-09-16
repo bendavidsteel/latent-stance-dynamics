@@ -23,7 +23,7 @@ def main(config):
     period = '2025-01-onwards'
     df_path = f'./data/stance_targets/{period}_doc_targets.parquet.zstd'
 
-    doc_target_df = pl.read_parquet(df_path)
+    doc_target_df = pl.read_parquet(df_path, n_rows=1000)
 
     model = StanceMining(
         model_name='Qwen/Qwen3-4B',

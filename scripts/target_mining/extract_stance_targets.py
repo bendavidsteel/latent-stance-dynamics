@@ -321,7 +321,7 @@ def main(config):
     platform_handler = PlatformHandler()
 
     # group by month
-    file_df = file_df.filter((pl.col('year') <= 2023) & (pl.col('month') <= 11)) # remove
+    # file_df = file_df.filter((pl.col('year') <= 2023) & (pl.col('month') <= 11)) # remove
     for month_files_df in file_df.sort(['year', 'month'], descending=True).partition_by(['year', 'month']):
         process_month(month_files_df, dir_path, save_path, platform_handler, finetune_kwargs, config)
 
