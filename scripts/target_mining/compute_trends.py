@@ -1,16 +1,13 @@
-import datetime
-import json
 import os
 import re
 
 import dotenv
+import numpy as np
 import polars as pl
 import requests
 import hydra
 
 from stancemining.estimate import infer_stance_trends_for_target, _get_classifier_profiles
-
-from deduplicate_targets import remove_bad_targets
 
 def get_session(base_url, username, password):
     res = requests.post(f"{base_url}/meologin", params={"username": username, "password": password}, verify=True)
@@ -42,25 +39,17 @@ def process_data(config):
     if not file_paths:
         raise ValueError("No stance data files found in the data directory")
     
-    dfs = [
-        pl.read_parquet(
-            file_path,
-            columns=['id', 'createtime', 'platform', 'Document', 'ParentDocument', 'Targets', 'Stances', 'seed']
-        ) for file_path in file_paths
-    ]
-    
-    # Concatenate the scanned DataFrames
-    df = pl.concat(dfs, how='diagonal_relaxed')
+    columns = ['id', 'createtime', 'platform', 'Targets', 'Stances', 'seed']
+    df = pl.read_parquet(file_paths, columns=columns)
 
     df = df.unique(['id', 'platform'])
 
     df = df.explode(['Targets', 'Stances'])\
         .rename({'Targets': 'Target', 'Stances': 'Stance'})
     df = df.drop_nulls('Target')
-
-    df = remove_bad_targets(df)
     
     df = df.with_columns(pl.col('seed').struct.unnest())
+    df = df.select(['createtime', 'Target', 'Stance', 'SeedName', 'PlatformHandleID'])
 
     # Get ordered list of all targets in a single pipeline
     target_count_df = df.group_by('Target').agg(pl.count().alias('count')).sort('count', descending=True)
@@ -76,14 +65,10 @@ def remove_low_count_targets(df, target_count_df, min_count):
     return df, target_count_df
 
 
-
-
 def precompute_trends_for_all_targets(config, df, target_count_df):
     """Precompute trend data for all targets with optimized batch processing"""
 
     classifier_profiles = _get_classifier_profiles('bendavidsteel/SmolLM2-360M-Instruct-stance-detection')
-    
-    filter_columns = ['platform', 'PlatformHandleID', 'SeedName']
 
     for target in target_count_df.to_dicts():
         target_name = target['Target']
@@ -100,16 +85,19 @@ def precompute_trends_for_all_targets(config, df, target_count_df):
         target_trend_df, gp_params = infer_stance_trends_for_target(
             df,
             target_name,
-            filter_columns=filter_columns,
-            interpolation_method='lowess',
+            filter_columns=[config.filter_column],
+            stance_target_type=config.stance_target_type,
+            interpolation_method=config.interpolation_method,
             time_column='createtime',
             classifier_profiles=classifier_profiles,
-            min_filter_count=20,
-            verbose=True
+            min_filter_count=config.min_filter_count,
+            verbose=True,
+            get_overall_trend=False
         )
         if target_trend_df is None or gp_params is None:
             print(f"Skipping {target_name}, no trends computed.")
             continue
+        print(f"Saving trends for target: {target_name}")
         target_trend_df.write_parquet(trend_path, compression='zstd')
         gp_df = pl.from_dicts(gp_params, schema_overrides={'loss': pl.Float64})
         gp_df.write_parquet(gp_path, compression='zstd')
@@ -179,6 +167,9 @@ def calculate_stance_statistics(df, valid_targets: pl.DataFrame):
 
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(config):
+    pl.set_random_seed(42)
+    np.random.seed(42)
+
     print("Starting precomputation process...")
     
     # Process the data
@@ -186,9 +177,7 @@ def main(config):
     print(f"Processed data for {len(target_count_df)} targets")
 
     # remove targets with low counts
-    df, target_count_df = remove_low_count_targets(df, target_count_df, 50)
-
-    # target_count_df = target_count_df.filter(pl.col('Target') == 'good morning is a greeting.')
+    df, target_count_df = remove_low_count_targets(df, target_count_df, 100)
 
     os.makedirs(config.trend_path, exist_ok=True)
 

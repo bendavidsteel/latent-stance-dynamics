@@ -5,33 +5,41 @@ import polars as pl
 
 from stancemining import StanceMining
 
+def process_existing_stance_file(batch_week_df: pl.DataFrame, week_batch_path: str):
+    original_batch_week_df = batch_week_df.clone()
+    try:
+        existing_batch_week_df = pl.read_parquet(week_batch_path)
+    except Exception as e:
+        return None, batch_week_df, None, None
+    
+    if 'Polarities' in existing_batch_week_df.columns:
+        existing_batch_week_df = existing_batch_week_df.rename({'Polarities': 'Stances'})
+    if 'stance_finetune_kwargs' not in existing_batch_week_df.columns:
+        existing_batch_week_df = existing_batch_week_df.with_columns(pl.lit(None).alias('stance_finetune_kwargs'))
+    existing_target_df = existing_batch_week_df.explode(['Targets', 'Stances']).drop_nulls('Targets').unique(['id', 'platform', 'Targets'])
+    
+    target_df = batch_week_df.explode('Targets').drop_nulls('Targets')
+    joined_target_df = target_df.join(existing_target_df.select(['id', 'platform', 'Targets', 'Stances', 'stance_finetune_kwargs']), on=['id', 'platform', 'Targets'], how='left')
+    remaining_target_df = joined_target_df.filter(pl.col('Stances').is_null()).drop(['Stances', 'stance_finetune_kwargs'])
+    existing_target_df = joined_target_df.filter(pl.col('Stances').is_not_null())
+    
+    if existing_target_df.is_empty():
+        existing_target_df = None
+    else:
+        assert existing_target_df.shape[0] + remaining_target_df.shape[0] == target_df.shape[0]
+
+        remaining_batch_week_df = remaining_target_df.group_by(['id', 'platform'])\
+            .agg([pl.col('Targets')] + [pl.col(c).first() for c in remaining_target_df.columns if c not in ['Targets', 'id', 'platform']])
+        
+        batch_week_df = remaining_batch_week_df
+
+    return existing_target_df, batch_week_df, original_batch_week_df, remaining_target_df
+
 def save_stance(batch_week_df: pl.DataFrame, miner: StanceMining, week_batch_path):
     if os.path.exists(week_batch_path):
-        original_batch_week_df = batch_week_df.clone()
-        existing_batch_week_df = pl.read_parquet(week_batch_path)
-        if 'Polarities' in existing_batch_week_df.columns:
-            existing_batch_week_df = existing_batch_week_df.rename({'Polarities': 'Stances'})
-        if 'stance_finetune_kwargs' not in existing_batch_week_df.columns:
-            existing_batch_week_df = existing_batch_week_df.with_columns(pl.lit(None).alias('stance_finetune_kwargs'))
-        existing_target_df = existing_batch_week_df.explode(['Targets', 'Stances']).drop_nulls('Targets').unique(['id', 'platform', 'Targets'])
-        
-        target_df = batch_week_df.explode('Targets').drop_nulls('Targets')
-        joined_target_df = target_df.join(existing_target_df.select(['id', 'platform', 'Targets', 'Stances', 'stance_finetune_kwargs']), on=['id', 'platform', 'Targets'], how='left')
-        remaining_target_df = joined_target_df.filter(pl.col('Stances').is_null()).drop(['Stances', 'stance_finetune_kwargs'])
-        existing_target_df = joined_target_df.filter(pl.col('Stances').is_not_null())
-        
-        if existing_target_df.is_empty():
-            existing_target_df = None
-        else:
-            assert existing_target_df.shape[0] + remaining_target_df.shape[0] == target_df.shape[0]
-
-            remaining_batch_week_df = remaining_target_df.group_by(['id', 'platform'])\
-                .agg([pl.col('Targets')] + [pl.col(c).first() for c in remaining_target_df.columns if c not in ['Targets', 'id', 'platform']])
-            
-            if remaining_batch_week_df.is_empty():
-                return
-
-            batch_week_df = remaining_batch_week_df
+        existing_target_df, batch_week_df, original_batch_week_df, remaining_target_df = process_existing_stance_file(batch_week_df, week_batch_path)
+        if batch_week_df.is_empty():
+            return
     else:
         existing_target_df = None
 
@@ -72,7 +80,7 @@ def save_stance(batch_week_df: pl.DataFrame, miner: StanceMining, week_batch_pat
 
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(config):
-    document_df = pl.read_parquet(f'./data/stance_targets/2024-06-01-onwards_doc_targets.parquet.zstd')
+    document_df = pl.read_parquet(f'./data/stance_targets/2022-01-01-onwards_{config.stance_target_type}_doc_targets.parquet.zstd')
     document_df = document_df.select(['id', 'Document', 'ParentDocument', 'createtime', 'seed', 'Targets', 'finetune_kwargs', 'platform'])
 
     # truncate text for now
@@ -81,8 +89,34 @@ def main(config):
         .filter(pl.col('text_len') < 8500).drop('text_len')
 
     # TODO train gemma3 sequence classification when this is in transformers release that vllm supports: https://github.com/huggingface/transformers/pull/39465
-    miner = StanceMining(verbose=True)
+    
+    if config.stance_target_type == 'claims':
+        stance_detection_finetune_kwargs = {
+            'model_path': '/home/ndg/users/bsteel2/repos/stancemining/models/stancemining/Qwen-Qwen3-0.6B-claim-entailment-7way-stanceosaurus-head-merged',
+            'classification_method': 'head',
+        }
+        stance_detection_model_kwargs = {
+            'gpu_memory_utilization': 0.8,
+        }
+    elif config.stance_target_type == 'noun-phrases':
+        stance_detection_finetune_kwargs = {
+            'model_path': '/home/ndg/users/bsteel2/repos/stancemining/models/stancemining/Qwen-Qwen3-4B-Instruct-2507-stance-classification-vast-ezstance-pstance-semeval-mtcsd-ctsdt-catalonia-french-election-head-merged',
+            'classification_method': 'head',
+        }
+        stance_detection_model_kwargs = {
+            'max_model_len': 8192,
+        }
+    else:
+        raise ValueError(f"Unknown stance_target_type: {config.stance_target_type}")
+    
+    miner = StanceMining(
+        verbose=True, 
+        stance_target_type=config.stance_target_type,
+        stance_detection_finetune_kwargs=stance_detection_finetune_kwargs,
+        stance_detection_model_kwargs=stance_detection_model_kwargs,
+    )
     # batch out calls
+    os.makedirs(config.base_stance_path, exist_ok=True)
     week_df = document_df.select([pl.col('createtime').dt.year().alias('year'), pl.col('createtime').dt.week().alias('week')]).unique().sort(['year', 'week'], descending=True)
     for week in week_df.to_dicts():
         week_batch_path = f'{config.base_stance_path}/{week["year"]}_{week["week"]}_doc_targets_with_stance.parquet.zstd'

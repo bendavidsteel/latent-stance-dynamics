@@ -12,7 +12,9 @@ import torch
 import transformers
 
 from stancemining.main import StanceMining
-from stancemining.utils import deduplicate_all_similar_targets
+from stancemining.utils import deduplicate_all_similar_targets, remove_doc_bad_targets
+
+from find_targets import filter_to_common_targets
 
 def get_raw_file(filename, platform):
     raw_path = '~/repos/sitrep/data/digital_trace/raw_platforms'
@@ -22,59 +24,7 @@ def get_raw_file(filename, platform):
     raw_day_df = pl.read_parquet(os.path.join(raw_path, raw_filename))
     return raw_day_df
 
-def remove_bad_targets(target_df: pl.DataFrame):
-    target_df = target_df.filter(~pl.col('Target').str.contains_any(['the user', 'url', 'the text', 'the speaker']))
-    target_df = target_df.filter(~pl.col("Target").str.contains("^the assistant"))
-    target_df = target_df.filter(pl.col('Target').str.len_chars() < 70)
-    target_df = target_df.filter(pl.col('Target').str.len_chars() > 20)
-    target_df = target_df.filter(~pl.col("Target").str.contains("^\w+ was mentioned.$"))
-    nouns = ['place', 'person', 'link', 'claim', 'city', 'region', 'nation', 'user', 'holiday', 'greeting', 'holiday greeting']
-    for noun in nouns:
-        target_df = target_df.filter(~pl.col("Target").str.contains(f"^\w+ is a {noun}.$"))
-        target_df = target_df.filter(~pl.col("Target").str.contains(f"^\w+ \w+ is a {noun}.$"))
-
-    if 'index' not in target_df.columns:
-        target_df = target_df.with_row_index()
-
-    superset_target_df = target_df.join(
-            target_df.select([
-                'index',
-                pl.col('Target').str.strip_chars('.').alias('shorter_target')
-            ]),
-            on='index',
-            how='left'
-        )\
-        .filter(pl.col('Target').str.len_chars() > pl.col('shorter_target').str.len_chars() + 1)\
-        .filter(pl.col('Target').str.contains(pl.col('shorter_target'), literal=True))\
-        .select(['index', 'Target'])\
-        .unique()
-    target_df = target_df.join(superset_target_df, on=['index', 'Target'], how='anti')
-
-    return target_df
-
-def deduplicate_subset_targets(targets):
-    targets = sorted(set(targets), key=len)  # Sort by length, shortest first
-    result = []
-    
-    for target in targets:
-        # Only add if no existing (shorter) target is a substring of this one
-        if not any(existing.strip('.') in target for existing in result):
-            result.append(target)
-    
-    return result
-
-def remove_doc_bad_targets(df: pl.DataFrame):
-    df = df.with_row_index()
-
-    # remove cases where there are more than 3 targets
-    df = df.with_columns(pl.col('Targets').list.slice(0, 3))
-    target_df = df.select(['index', 'Targets']).explode('Targets').rename({'Targets': 'Target'})
-    target_df = remove_bad_targets(target_df)
-    target_df = target_df.group_by('index').agg(pl.col('Target')).rename({'Target': 'Targets'})
-    df = df.drop('Targets').join(target_df, on='index', how='left').with_columns(pl.col('Targets').fill_null([]))
-    df = df.drop('index')
-
-    return df
+EMOJI_REGEX = r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF]'
 
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(config):
@@ -87,12 +37,8 @@ def main(config):
     torch.manual_seed(42)
     
     target_dir = config.base_target_path
-    document_df = pl.DataFrame()
-    for filename in tqdm(os.listdir(target_dir), desc='Loading files...'):
-        if re.match('targets_\d{4}_\d{1,2}.parquet.zstd', filename):
-            target_file_df = pl.read_parquet(f'{target_dir}/{filename}')
-            document_df = pl.concat([document_df, target_file_df], how='diagonal_relaxed')
-    
+    document_df = pl.read_parquet([f'{target_dir}/{filename}' for filename in os.listdir(target_dir) if re.match('targets_\d{4}_\d{1,2}.parquet.zstd', filename)])
+        
     logger.info(f'Loaded {document_df.shape[0]} documents from {len(os.listdir(target_dir))} files.')
 
     document_df = document_df.unique(['id', 'platform'])
@@ -103,10 +49,22 @@ def main(config):
     document_df = document_df.filter(pl.col('createtime') >= start_date)
     logger.info(f'Filtered documents to {document_df.shape[0]} after {start_date_str}.')
 
+    document_df = document_df.with_columns(pl.col('Targets').list.eval(pl.element().str.replace(r'\s*\([^)]*\)', '')\
+                                                                       .str.strip_chars_end(',.:?!')\
+                                                                       .str.strip_chars_start('@#')\
+                                                                       .str.replace(',.*', '')\
+                                                                       .str.replace(EMOJI_REGEX, '')\
+                                                                       .str.replace('^rt @ ', '')\
+                                                                       .str.replace('^rt@', '')\
+                                                                       .str.strip_chars()))
+
     # remove bad targets
     print(f"Before filtering bad targets, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets present.")
-    document_df = remove_doc_bad_targets(document_df)
+    document_df = remove_doc_bad_targets(document_df, config.stance_target_type)
     print(f"After filtering bad targets, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets remain.")
+
+    document_df = filter_to_common_targets(document_df, num_targets=3000000)
+    print(f"After filtering to common targets, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets remain.")
 
     model = StanceMining(
         model_name='Qwen/Qwen3-4B',
@@ -134,7 +92,7 @@ def main(config):
     logger.info(f"Before de-duplicating similar targets, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets present.")
     
     if document_df.select('Targets').explode('Targets').unique('Targets').shape[0] < 4000000:
-        document_df = deduplicate_all_similar_targets(document_df, model.embedding_model, batch_size=100000, minhash_threshold=0.5, max_embedding_distance=0.25)
+        document_df = deduplicate_all_similar_targets(document_df, model.embedding_model, config.stance_target_type, batch_size=3000000, minhash_threshold=0.5, max_embedding_distance=0.15)
     else:
         minhash_threshold = 0.7
         max_embedding_distance = 0.15
@@ -148,11 +106,11 @@ def main(config):
                 for i in batch_idx:
                     logger.info(f"Processing batch {i // batch_size + 1}/{len(batch_idx)}")
                     batch = document_df.slice(i, batch_size)
-                    batch = deduplicate_all_similar_targets(batch, model.embedding_model, batch_size=batch_size, minhash_threshold=minhash_threshold, max_embedding_distance=max_embedding_distance)
+                    batch = deduplicate_all_similar_targets(batch, model.embedding_model, config.stance_target_type, batch_size=batch_size, minhash_threshold=minhash_threshold, max_embedding_distance=max_embedding_distance)
                     new_document_df = pl.concat([new_document_df, batch], how='diagonal_relaxed')
                 document_df = new_document_df
             else:
-                document_df = deduplicate_all_similar_targets(document_df, model.embedding_model, batch_size=100000, minhash_threshold=minhash_threshold, max_embedding_distance=max_embedding_distance)
+                document_df = deduplicate_all_similar_targets(document_df, model.embedding_model, config.stance_target_type, batch_size=100000, minhash_threshold=minhash_threshold, max_embedding_distance=max_embedding_distance)
             logger.info(f"After de-duplicating similar targets with minhash_threshold={minhash_threshold} and max_embedding_distance={max_embedding_distance}, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets remain.")
             minhash_threshold -= 0.1
             minhash_threshold = max(minhash_threshold, 0.2)
@@ -161,7 +119,7 @@ def main(config):
 
     logger.info(f"After de-duplicating similar targets, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets remain.")
 
-    document_df.write_parquet(f'./data/stance_targets/{period}_doc_targets_deduplicated.parquet.zstd', compression='zstd')
+    document_df.write_parquet(f'./data/stance_targets/{period}_{config.stance_target_type}_doc_targets_deduplicated.parquet.zstd', compression='zstd')
 
 if __name__ == '__main__':
     main()

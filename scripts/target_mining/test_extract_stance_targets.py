@@ -9,8 +9,7 @@ import torch
 from tqdm import tqdm
 
 from stancemining.main import StanceMining
-
-os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+from find_targets import remove_bad_targets
 
 def add_dialogue_turn(df: pl.DataFrame):
     """
@@ -43,6 +42,7 @@ def add_dialogue_turn(df: pl.DataFrame):
 
 class PlatformHandler:
     def __init__(self):
+        self.tiktok_transcript_df = pl.read_parquet('./data/tiktok/transcripts.parquet.zstd')
         self.tiktok_speaker_author_df = pl.read_parquet('./data/tiktok/speaker_author.parquet.zstd').with_columns(pl.col('video_id').cast(pl.UInt64))
 
         dir_path = '../sitrep/data/digital_trace/raw_platforms'
@@ -58,21 +58,27 @@ class PlatformHandler:
             .with_columns(pl.col('date_numbers').list.get(1).cast(pl.UInt8).alias('month'))\
             .with_columns(pl.col('date_numbers').list.get(2).cast(pl.UInt8).alias('day'))
 
-        self.twitter_df = pl.read_parquet(file_df.select(pl.format('{}/{}', pl.lit(dir_path), pl.col('file')).alias('file_path'))['file_path'].to_list(), columns=['id', 'rawContent'])\
-            .with_columns(pl.col('id').cast(pl.UInt64))
+        self.twitter_df = pl.DataFrame()
+        for file_name in tqdm(file_df['file']):
+            batch_df = pl.read_parquet(f'{dir_path}/{file_name}', columns=['id', 'rawContent']).with_columns(pl.col('id').cast(pl.UInt64))
+            self.twitter_df = pl.concat([self.twitter_df, batch_df], how='diagonal_relaxed')
 
 
     def format_platform_data(self, df: pl.DataFrame, platform):
         if platform == 'tiktok':
             # TODO format text with author
             df = df.with_columns(pl.col('video_id').cast(pl.UInt64))
-            df = df.filter(pl.col('transcripts').is_not_null())
+            df = df.join(
+                self.tiktok_transcript_df.select([pl.col('video_id'), 'transcript']), 
+                on='video_id', 
+                how='left'
+            ).filter(pl.col('transcript').is_not_null())
             unique_speaker_df = df.select([
                 'video_id', 
-                (pl.col('transcripts').struct.field('segments').list.eval(pl.col('').struct.field('speaker')).list.unique().list.len() > 1).alias('multiple_speakers')
+                (pl.col('transcript').struct.field('segments').list.eval(pl.col('').struct.field('speaker')).list.unique().list.len() > 1).alias('multiple_speakers')
             ])
             # get speaker indexs
-            df = df.with_columns(pl.col('transcripts').struct.field('segments'))\
+            df = df.with_columns(pl.col('transcript').struct.field('segments'))\
                 .explode('segments')\
                 .with_columns(pl.col('segments').struct.unnest())\
                 .with_columns(pl.col('speaker').str.split('_').list.get(-1).cast(pl.UInt32).alias('speaker_index'))
@@ -179,20 +185,6 @@ class PlatformHandler:
             raise NotImplementedError("Haven't implemented this platform")
         
         return df.select(['createtime', 'Document', 'ParentDocument', 'id', 'platform', 'seed'])
-    
-    def get_platform_columns(self, platform):
-        if platform == 'tiktok':
-            return ['video_id', 'createtime', 'seed', 'transcripts']
-        elif platform == 'instagram':
-            return ['caption', 'taken_at', 'seed', 'id']
-        elif platform == 'instagram-meta':
-            return ['description', 'date', 'seed', 'id']
-        elif platform == 'twitter':
-            return ['id', 'inReplyToTweetId', 'quotedTweet', 'rawContent', 'date', 'seed']
-        elif platform == 'bluesky':
-            return ['reply', 'text', 'date', 'seed', 'id']
-        else:
-            raise NotImplementedError("Haven't implemented this platform")
 
 def join_text(df: pl.DataFrame):
     return df.with_columns(
@@ -202,7 +194,7 @@ def join_text(df: pl.DataFrame):
             .alias('AllText')
     )
 
-def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, save_path, platform_handler: PlatformHandler, finetune_kwargs, config):
+def process_month(month_files_df: pl.DataFrame, dir_path, save_path, platform_handler: PlatformHandler, finetune_kwargs, config):
     try:
         year = month_files_df['year'][0]
         month = month_files_df['month'][0]
@@ -213,26 +205,15 @@ def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, s
         pbar = tqdm(total=len(month_files_df), desc='Loading raw files')
         for platform in month_files_df['platform'].unique().to_list():
             platform_df = pl.DataFrame()
-            platform_columns = platform_handler.get_platform_columns(platform)
-            file_paths = month_files_df.filter(pl.col('platform') == platform)\
-                .select(pl.format('{}/{}', pl.lit(dir_path), pl.col('file')).alias('file_path'))['file_path'].to_list()
-            try:
-                platform_df = pl.read_parquet(file_paths, columns=platform_columns)
-            except:
-                dfs = []
-                for file_path in file_paths:
-                    try:
-                        file_df = pl.read_parquet(file_path, columns=platform_columns)
-                        dfs.append(file_df)
-                    except Exception as ex:
-                        print(f"Error reading file {file_path} for platform {platform}: {ex}")
-                        continue
-                if len(dfs) == 0:
-                    print(f"No valid files for platform {platform} in {date_str}")
-                    pbar.update(len(file_paths))
+            for file in month_files_df.filter(pl.col('platform') == platform).to_dicts():
+                pbar.update(1)
+                file_name = file['file']
+                try:
+                    batch_df = pl.read_parquet(f'{dir_path}/{file_name}')
+                    platform_df = pl.concat([platform_df, batch_df], how='diagonal_relaxed')
+                except Exception as ex:
+                    print(f"Error reading {file_name}: {ex}")
                     continue
-                platform_df = pl.concat(dfs, how='diagonal_relaxed')
-            pbar.update(len(file_paths))
             try:
                 platform_df = platform_handler.format_platform_data(platform_df, platform)
                 df = pl.concat([df, platform_df], how='diagonal_relaxed')
@@ -260,8 +241,6 @@ def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, s
             if 'AllText' not in target_df.columns:
                 target_df = join_text(target_df)
 
-            target_df = target_df.filter(pl.col('Targets').is_not_null())
-
             df = df.join(target_df, on=['id', 'platform'], how='left')
             existing_df = df.filter((pl.col('Document').fill_null('') == pl.col('Document_right').fill_null('')) & ((pl.col('ParentDocument').fill_null('') == pl.col('ParentDocument_right').fill_null(''))))\
                 .select(['id', 'seed', 'createtime', 'platform', 'Document', 'ParentDocument', 'Targets', 'finetune_kwargs'])
@@ -277,10 +256,21 @@ def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, s
 
         docs = unique_df['AllText'].to_list()
 
+        model = StanceMining(
+            # target_extraction_model_kwargs={'enforce_eager': True},
+            target_extraction_finetune_kwargs=finetune_kwargs,
+            stance_target_type=config.stance_target_type,
+            verbose=True,
+        )
+
         doc_df = model.get_base_targets(docs)
 
         # filter out some targets
         text_col = 'text' if 'text' in doc_df.columns else 'Document'
+        target_df = doc_df.explode('Targets').rename({'Targets': 'Target'})
+        target_df = remove_bad_targets(target_df)
+        doc_df = target_df.group_by(['ID', text_col]).agg(pl.col('Target')).rename({'Target': 'Targets'})
+
         target_df = unique_df.select(['id', 'platform', 'Document', 'AllText']).join(doc_df.select([text_col, 'Targets']), left_on='AllText', right_on=text_col, how='left').drop('AllText')
         target_df = target_df.with_columns(pl.lit(finetune_kwargs).alias('finetune_kwargs'))
 
@@ -300,23 +290,8 @@ def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, s
 def main(config):
     dir_path = '../sitrep/data/digital_trace/raw_platforms'
 
-    platforms = ['twitter', 'instagram', 'instagram-meta', 'tiktok', 'bluesky']
-
-    data_files = os.listdir(dir_path)
-    file_df = pl.DataFrame({'file': data_files})
-    file_df = file_df.filter(pl.col('file').str.contains_any(platforms))
-    file_df = file_df.filter(pl.col('file').str.ends_with('parquet.zstd'))
-
-    # parse out date from file name
-    file_df = file_df.with_columns([
-            pl.col('file').str.split('_').list.get(1).str.split('.').list.get(0).str.split('-').alias('date_numbers'),
-            pl.col('file').str.split('_').list.get(0).alias('platform')
-        ])\
-        .with_columns([
-            pl.col('date_numbers').list.get(0).cast(pl.UInt16).alias('year'),
-            pl.col('date_numbers').list.get(1).cast(pl.UInt8).alias('month'),
-            pl.col('date_numbers').list.get(2).cast(pl.UInt8).alias('day')
-        ])
+    file_name = 'twitter_2024-09-19.json'
+    docs_df = pl.read_json(os.path.join(dir_path, file_name), infer_schema_length=1000000)
     
     finetune_kwargs = {
         'model_path': config.model_name,
@@ -326,22 +301,15 @@ def main(config):
         'generation_method': 'list'
     }
 
-    save_path = config.base_target_path
-
-    platform_handler = PlatformHandler()
-
     model = StanceMining(
         # target_extraction_model_kwargs={'enforce_eager': True},
         target_extraction_finetune_kwargs=finetune_kwargs,
         stance_target_type=config.stance_target_type,
         verbose=True,
     )
-    # model = None
 
-    # group by month
-    # file_df = file_df.filter((pl.col('year') <= 2024) & (pl.col('month') <= 10)) # remove
-    for month_files_df in file_df.sort(['year', 'month'], descending=True).partition_by(['year', 'month']):
-        process_month(month_files_df, model, dir_path, save_path, platform_handler, finetune_kwargs, config)
+    docs = docs_df['rawContent'].to_list()
+    doc_df = model.get_base_targets(docs)
 
 if __name__ == '__main__':
     main()
