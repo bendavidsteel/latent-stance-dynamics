@@ -177,7 +177,7 @@ def main(config):
     print(f"Processed data for {len(target_count_df)} targets")
 
     # remove targets with low counts
-    df, target_count_df = remove_low_count_targets(df, target_count_df, 100)
+    df, target_count_df = remove_low_count_targets(df, target_count_df, config.min_target_volume)
 
     os.makedirs(config.trend_path, exist_ok=True)
 

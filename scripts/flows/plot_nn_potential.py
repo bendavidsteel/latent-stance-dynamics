@@ -9,7 +9,6 @@ import matplotlib.animation
 import matplotlib.lines
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Patch
 import numpy as np
 import polars as pl
@@ -138,13 +137,10 @@ def t_to_datetime(t):
 
 def show_x_dim_labels(ax, dimension_labels, dim):
     # Get dimension 0 (x-axis) labels
-    dim0 = dimension_labels[str(dim)]['5_cat']
+    dim0 = dimension_labels[str(dim)]['3_cat']
     x_tick_labels = []
     x_tick_positions = []
 
-    if 'very_negative' in dim0:
-        x_tick_labels.append(dim0['very_negative'])
-        x_tick_positions.append(dim0['v_negative_threshold'])
     if 'negative' in dim0:
         x_tick_labels.append(dim0['negative'])
         x_tick_positions.append(dim0['negative_threshold'])
@@ -154,9 +150,6 @@ def show_x_dim_labels(ax, dimension_labels, dim):
     if 'positive' in dim0:
         x_tick_labels.append(dim0['positive'])
         x_tick_positions.append(dim0['positive_threshold'])
-    if 'very_positive' in dim0:
-        x_tick_labels.append(dim0['very_positive'])
-        x_tick_positions.append(dim0['v_positive_threshold'])
 
     if x_tick_positions:
         ax.set_xticks(x_tick_positions)
@@ -164,13 +157,10 @@ def show_x_dim_labels(ax, dimension_labels, dim):
 
 def show_y_dim_labels(ax, dimension_labels, dim):
     # Get dimension 1 (y-axis) labels
-    dim1 = dimension_labels[str(dim)]['5_cat']
+    dim1 = dimension_labels[str(dim)]['3_cat']
     y_tick_labels = []
     y_tick_positions = []
 
-    if 'very_negative' in dim1:
-        y_tick_labels.append(dim1['very_negative'])
-        y_tick_positions.append(dim1['v_negative_threshold'])
     if 'negative' in dim1:
         y_tick_labels.append(dim1['negative'])
         y_tick_positions.append(dim1['negative_threshold'])
@@ -180,13 +170,10 @@ def show_y_dim_labels(ax, dimension_labels, dim):
     if 'positive' in dim1:
         y_tick_labels.append(dim1['positive'])
         y_tick_positions.append(dim1['positive_threshold'])
-    if 'very_positive' in dim1:
-        y_tick_labels.append(dim1['very_positive'])
-        y_tick_positions.append(dim1['v_positive_threshold'])
 
     if y_tick_positions:
         ax.set_yticks(y_tick_positions)
-        ax.set_yticklabels(y_tick_labels, fontsize=8)
+        ax.set_yticklabels(y_tick_labels, fontsize=8, rotation=15, ha='right')
 
 def load_dimension_labels(dimension_labels_path):
     """Load dimension labels from JSON file created by pca_dimensions.py"""
@@ -240,7 +227,7 @@ def linewidth_to_flow(lw, max_val):
     return 10 ** log_flow
 
 
-def build_legend_elements(flow_percentiles=None):
+def build_legend_elements(flow_percentiles=None, show_hatching=True):
     """Build legend elements for streamplot and uncertainty hatching."""
     if flow_percentiles is not None:
         _, _, _, _, max_val = flow_percentiles
@@ -258,21 +245,22 @@ def build_legend_elements(flow_percentiles=None):
             matplotlib.lines.Line2D([0], [0], color='red', alpha=0.7, linewidth=2,
                    label='Flow patterns'),
         ]
-    legend_elements.extend([
-        Patch(facecolor='none', edgecolor='black', hatch='/', label='Low uncertainty'),
-        Patch(facecolor='none', edgecolor='black', hatch='//', label='Medium uncertainty'),
-        Patch(facecolor='none', edgecolor='black', hatch='xxx', label='High uncertainty')
-    ])
+    if show_hatching:
+        legend_elements.extend([
+            Patch(facecolor='none', edgecolor='black', hatch='/', label='Low uncertainty'),
+            Patch(facecolor='none', edgecolor='black', hatch='//', label='Medium uncertainty'),
+            Patch(facecolor='none', edgecolor='black', hatch='xxx', label='High uncertainty')
+        ])
     return legend_elements
 
-def add_legend(ax, flow_percentiles=None, **kwargs):
+def add_legend(ax, flow_percentiles=None, show_hatching=True, **kwargs):
     """Add legend for streamplot and uncertainty hatching to an axes."""
-    legend_elements = build_legend_elements(flow_percentiles)
+    legend_elements = build_legend_elements(flow_percentiles, show_hatching=show_hatching)
     ax.legend(handles=legend_elements, loc='upper right', **kwargs)
 
-def add_fig_legend(fig, flow_percentiles=None, **kwargs):
+def add_fig_legend(fig, flow_percentiles=None, show_hatching=True, **kwargs):
     """Add legend for streamplot and uncertainty hatching to a figure."""
-    legend_elements = build_legend_elements(flow_percentiles)
+    legend_elements = build_legend_elements(flow_percentiles, show_hatching=show_hatching)
     fig.legend(handles=legend_elements, loc='upper right', **kwargs)
 
 def compute_flow_magnitude(model, t, xs, ys, confinement_threshold, mc_dropout, key,
@@ -309,7 +297,7 @@ def compute_flow_magnitude(model, t, xs, ys, confinement_threshold, mc_dropout, 
 
 def plot_flow_field(ax, model, t, xs, ys, confinement_threshold, mc_dropout, key, max_flow=None, min_flow=None,
                     dim_1=None, dim_2=None, marginal_samples=None, n_marginal=256,
-                    variance_levels=None, hatch_patterns=None):
+                    variance_levels=None, hatch_patterns=None, show_hatching=True):
     """Compute flow field from model gradient.
 
     If ``variance_levels`` and ``hatch_patterns`` are provided, they are used
@@ -353,6 +341,9 @@ def plot_flow_field(ax, model, t, xs, ys, confinement_threshold, mc_dropout, key
     ax.streamplot(xs, ys, fu, fv,
                  density=1.5, color='red',
                  arrowsize=1.5, linewidth=lw, arrowstyle='->')
+
+    if not show_hatching:
+        return fu, fv, grad_phi_std, flow_percentiles
 
     # Uncertainty hatching — shared across axes when caller supplies thresholds.
     grad_phi_std_np = np.array(grad_phi_std)
@@ -411,7 +402,7 @@ def build_global_variance_levels(all_variances):
 def add_colorbar(contours, ax, fig=None):
     if fig is None:
         fig = plt.gcf()
-    cbar = fig.colorbar(contours, ax=ax, shrink=0.3, format='%.1e', aspect=40)
+    cbar = fig.colorbar(contours, ax=ax, shrink=0.3, format='%.1e', aspect=40, pad=0.017)
     cbar.set_label('Log Stance State Density', rotation=270, labelpad=15)
 
 def animate_density_streamplot(
@@ -567,18 +558,22 @@ def plot_density_streamplot(
         n_dims=21,
         variance_levels=None,
         hatch_patterns=None,
+        show_kde=True,
+        show_hatching=True,
         **kwargs
     ):
     coord_col = f'coord_{n_dims}d'
-    # Create KDE background
-    # filter into t_range
-    target_df = filter_df_to_time_range(target_df, t_range)
-    coords = target_df[coord_col].to_numpy()[:, [dim_1, dim_2]]
-    contours, _, _ = create_kde_background(coords, ax, alpha=0.7, levels=levels, x_min=xrange[0], x_max=xrange[1], y_min=yrange[0], y_max=yrange[1])
+    if show_kde:
+        # filter into t_range
+        target_df = filter_df_to_time_range(target_df, t_range)
+        coords = target_df[coord_col].to_numpy()[:, [dim_1, dim_2]]
+        contours, _, _ = create_kde_background(coords, ax, alpha=0.7, levels=levels, x_min=xrange[0], x_max=xrange[1], y_min=yrange[0], y_max=yrange[1])
 
-    # Add colorbar for KDE density
-    if show_colorbar and contours is not None:
-        add_colorbar(contours, ax, fig=fig)
+        # Add colorbar for KDE density
+        if show_colorbar and contours is not None:
+            add_colorbar(contours, ax, fig=fig)
+    else:
+        contours = None
 
     # Calculate flow field for streamplot
     print("Calculating flow field...")
@@ -594,7 +589,8 @@ def plot_density_streamplot(
         ax, model, t, xs, ys, confinement_threshold, mc_dropout, key,
         max_flow=max_flow, min_flow=min_flow,
         dim_1=dim_1, dim_2=dim_2, marginal_samples=marginal_samples, n_marginal=n_marginal,
-        variance_levels=variance_levels, hatch_patterns=hatch_patterns)
+        variance_levels=variance_levels, hatch_patterns=hatch_patterns,
+        show_hatching=show_hatching)
 
     # Setup axis labels (conditionally)
     if show_x_axis_labels:
@@ -665,7 +661,8 @@ def main(cfg):
     PLOT_ANI = False
     PLOT_TIME = True
     PLOT_PLATFORM = False
-    PLOT_DIMS = True
+    PLOT_TRAJECTORIES = False
+    PLOT_POTENTIAL_LANDSCAPES = False
     PLOT_SINGLE = False
 
     dims_str = '_'.join(str(d) for d in range(cfg.n_dims))
@@ -707,13 +704,11 @@ def main(cfg):
     
 
     if PLOT_TIME:
-        fig, axes = plt.subplots(2, 2, figsize=(11, 10))
-        axes = axes.flatten()
-        years = range(2022, 2026, 1)
+        years = [2023, 2024, 2025]
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4.5))
 
-        # Pre-compute flow and variance magnitudes across all years for global normalization
+        # Pre-compute flow magnitudes across all years for global linewidth normalization
         all_flow_magnitudes = []
-        all_variance_magnitudes = []
         spatial_res = plot_kwargs.get('spatial_res', 50)
         x = np.linspace(*plot_kwargs['xrange'], spatial_res, dtype=np.float64)
         y = np.linspace(*plot_kwargs['yrange'], spatial_res, dtype=np.float64)
@@ -721,7 +716,7 @@ def main(cfg):
         for yr in tqdm(years, desc="Pre-computing flow (time)"):
             t_range = (datetime.datetime(yr, 1, 1) - INITIAL_DATE).days / UNIT_DAYS, (datetime.datetime(yr, 12, 31) - INITIAL_DATE).days / UNIT_DAYS
             t_mid = (t_range[0] + t_range[1]) / 2.0
-            mag, var_mag = compute_flow_magnitude(
+            mag, _ = compute_flow_magnitude(
                 model, t_mid, xs, ys,
                 plot_kwargs['confinement_threshold'],
                 plot_kwargs.get('mc_dropout'), plot_kwargs.get('key'),
@@ -729,7 +724,6 @@ def main(cfg):
                 n_marginal=plot_kwargs.get('n_marginal', 256)
             )
             all_flow_magnitudes.append(mag)
-            all_variance_magnitudes.append(var_mag)
 
         all_mags = np.concatenate([m.flatten() for m in all_flow_magnitudes])
         global_min = all_mags.min()
@@ -738,9 +732,6 @@ def main(cfg):
         global_p75 = np.percentile(all_mags, 75)
         global_max = all_mags.max()
 
-        all_vars = np.concatenate([m.flatten() for m in all_variance_magnitudes])
-        variance_levels, hatch_patterns = build_global_variance_levels(all_vars)
-
         for i, yr in enumerate(tqdm(years, desc="Plotting time snapshots")):
             t_range = (datetime.datetime(yr, 1, 1) - INITIAL_DATE).days / UNIT_DAYS, (datetime.datetime(yr, 12, 31) - INITIAL_DATE).days / UNIT_DAYS
             plot_kwargs['t_range'] = t_range
@@ -748,36 +739,28 @@ def main(cfg):
             plot_kwargs['max_flow'] = global_max
             plot_kwargs['min_flow'] = global_min
             plot_kwargs['show_legend'] = False
-            plot_kwargs['show_x_axis_labels'] = i in [2,3]
-            plot_kwargs['show_y_axis_labels'] = i in [0,2]
-            plot_kwargs['show_x_tick_labels'] = i in [2,3]
-            plot_kwargs['show_y_tick_labels'] = i in [0,2]
-            plot_kwargs['variance_levels'] = variance_levels
-            plot_kwargs['hatch_patterns'] = hatch_patterns
-            ax, contours = plot_density_streamplot(fig, axes[i], model, target_df, components, stance_cols, **plot_kwargs)
-            if 'levels' not in plot_kwargs:
-                plot_kwargs['levels'] = contours._levels
+            plot_kwargs['show_x_axis_labels'] = True
+            plot_kwargs['show_y_axis_labels'] = (i == 0)
+            plot_kwargs['show_x_tick_labels'] = True
+            plot_kwargs['show_y_tick_labels'] = (i == 0)
+            plot_kwargs['show_kde'] = False
+            plot_kwargs['show_hatching'] = False
+            plot_density_streamplot(fig, axes[i], model, target_df, components, stance_cols, **plot_kwargs)
             axes[i].set_title(f'{t_to_datetime(t_range[0]).strftime("%Y")}')
 
         fig.subplots_adjust(
-            left=0.01,
-            right=0.91,
-            top=0.99,
-            bottom=0.1,
-            wspace=0.04,
-            hspace=0.08
+            left=0.05,
+            right=0.85,
+            top=0.93,
+            bottom=0.15,
+            wspace=0.08
         )
-
-        # Manually position colorbar axis: [left, bottom, width, height]
-        cax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
-        cbar = fig.colorbar(contours, cax=cax, format='%.1e', aspect=40)
-        cbar.set_label('Log Stance State Density', rotation=270, labelpad=15)
 
         # Add shared legend on top-right axes
         global_flow_percentiles = (global_min, global_p25, global_p50, global_p75, global_max)
-        add_legend(axes[1], flow_percentiles=global_flow_percentiles, bbox_to_anchor=(1.2, 1.2))
+        add_legend(axes[-1], flow_percentiles=global_flow_percentiles, show_hatching=False, bbox_to_anchor=(1.5, 1.0))
 
-        fig.savefig('./figs/nn_potential_density_streamplot_time_snapshots.png', bbox_inches='tight', dpi=150, pad_inches=0)
+        fig.savefig(f'{fig_path}/nn_potential_density_streamplot_time_snapshots.png', bbox_inches='tight', dpi=150, pad_inches=0)
 
     if PLOT_PLATFORM:
         platform_pretty = {
@@ -787,11 +770,14 @@ def main(cfg):
             'bluesky': 'Bluesky'
         }
 
-        fig, axes = plt.subplots(2, 2, figsize=(10, 9))
-        axes = axes.flatten()
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4.5))
 
-        # Load all platform models upfront — mirror the directory layout used by nn_potential.py
+        # Load all platform models upfront — mirror the directory layout used by nn_potential.py.
+        # Build per-platform marginal_samples from the corresponding filter_value subset so
+        # the marginalization over non-displayed dims reflects that platform's distribution.
         platform_models = {}
+        platform_dfs = {}
+        platform_marginal_samples = {}
         trend_name = 'platform_handle_noun_phrase_bkrr_trends'
         for platform in PLATFORMS:
             platform_dir = f'dims_{dims_str}_{platform}_rm292'
@@ -799,24 +785,30 @@ def main(cfg):
             platform_state_path = get_most_recent_state(platform_states_path)
             platform_models[platform], _ = DeepTimePhiPLNN.load(platform_state_path, dtype=dtype)
 
-        # Pre-compute flow and variance magnitudes across all platforms for global normalization
+            platform_dfs[platform] = target_df.filter(
+                pl.col('filter_value').cast(pl.String) \
+                    .str.to_lowercase() \
+                    .str.contains(f'-{platform}-')
+            )
+            plat_coords = platform_dfs[platform][f'coord_{cfg.n_dims}d'].to_numpy()
+            platform_marginal_samples[platform] = plat_coords[:, :cfg.n_dims] if cfg.n_dims > 2 else None
+
+        # Pre-compute flow magnitudes across all platforms for global linewidth normalization
         all_flow_magnitudes = []
-        all_variance_magnitudes = []
         spatial_res = plot_kwargs.get('spatial_res', 50)
         x = np.linspace(*plot_kwargs['xrange'], spatial_res, dtype=np.float64)
         y = np.linspace(*plot_kwargs['yrange'], spatial_res, dtype=np.float64)
         xs, ys = np.meshgrid(x, y)
         t_mid = (trange[0] + trange[1]) / 2.0
         for platform in tqdm(PLATFORMS, desc="Pre-computing flow (platform)"):
-            mag, var_mag = compute_flow_magnitude(
+            mag, _ = compute_flow_magnitude(
                 platform_models[platform], t_mid, xs, ys,
                 platform_models[platform].confinement_threshold,
                 plot_kwargs.get('mc_dropout'), plot_kwargs.get('key'),
-                dim_1=0, dim_2=1, marginal_samples=marginal_samples,
+                dim_1=0, dim_2=1, marginal_samples=platform_marginal_samples[platform],
                 n_marginal=plot_kwargs.get('n_marginal', 256)
             )
             all_flow_magnitudes.append(mag)
-            all_variance_magnitudes.append(var_mag)
 
         all_mags = np.concatenate([m.flatten() for m in all_flow_magnitudes])
         global_min = all_mags.min()
@@ -825,19 +817,9 @@ def main(cfg):
         global_p75 = np.percentile(all_mags, 75)
         global_max = all_mags.max()
 
-        all_vars = np.concatenate([m.flatten() for m in all_variance_magnitudes])
-        variance_levels, hatch_patterns = build_global_variance_levels(all_vars)
-
-        contours = None
         for i, platform in enumerate(tqdm(PLATFORMS, desc="Plotting platforms")):
             platform_model = platform_models[platform]
-
-            # Filter target_df by platform
-            platform_df = target_df.filter(
-                pl.col('filter_value').cast(pl.String) \
-                    .str.to_lowercase() \
-                    .str.contains(f'-{platform}-')
-            )
+            platform_df = platform_dfs[platform]
 
             platform_plot_kwargs = plot_kwargs.copy()
             platform_plot_kwargs['t_range'] = trange
@@ -846,62 +828,37 @@ def main(cfg):
             platform_plot_kwargs['min_flow'] = global_min
             platform_plot_kwargs['show_legend'] = False
             platform_plot_kwargs['confinement_threshold'] = platform_model.confinement_threshold
-            platform_plot_kwargs['show_x_tick_labels'] = i in [2, 3]
-            platform_plot_kwargs['show_y_tick_labels'] = i in [0, 2]
-            platform_plot_kwargs['show_x_axis_labels'] = i in [2, 3]
-            platform_plot_kwargs['show_y_axis_labels'] = i in [0, 2]
-            platform_plot_kwargs['variance_levels'] = variance_levels
-            platform_plot_kwargs['hatch_patterns'] = hatch_patterns
+            platform_plot_kwargs['marginal_samples'] = platform_marginal_samples[platform]
+            platform_plot_kwargs['show_x_tick_labels'] = True
+            platform_plot_kwargs['show_y_tick_labels'] = (i == 0)
+            platform_plot_kwargs['show_x_axis_labels'] = True
+            platform_plot_kwargs['show_y_axis_labels'] = (i == 0)
+            platform_plot_kwargs['show_kde'] = False
+            platform_plot_kwargs['show_hatching'] = False
 
-            if contours is not None:
-                platform_plot_kwargs['levels'] = contours._levels
-
-            _, contours = plot_density_streamplot(
+            plot_density_streamplot(
                 fig, axes[i], platform_model, platform_df, components, stance_cols,
                 **platform_plot_kwargs
             )
             axes[i].set_title(platform_pretty[platform])
 
         fig.subplots_adjust(
-            left=0.01,
-            right=0.91,
-            top=0.99,
-            bottom=0.1,
-            wspace=0.01,
-            hspace=0.08
+            left=0.05,
+            right=0.85,
+            top=0.93,
+            bottom=0.15,
+            wspace=0.08
         )
-
-        # Manually position colorbar axis
-        cax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
-        cbar = fig.colorbar(contours, cax=cax, format='%.1e', aspect=40)
-        cbar.set_label('Log Stance State Density', rotation=270, labelpad=15)
 
         # Add shared legend on top-right axes
         global_flow_percentiles = (global_min, global_p25, global_p50, global_p75, global_max)
-        add_legend(axes[1], flow_percentiles=global_flow_percentiles, bbox_to_anchor=(1.3, 1.1))
+        add_legend(axes[-1], flow_percentiles=global_flow_percentiles, show_hatching=False, bbox_to_anchor=(1.5, 1.0))
 
         fig.savefig(f'{fig_path}/nn_potential_density_streamplot_platform_snapshots.png', bbox_inches='tight', dpi=150, pad_inches=0)
 
     NUM_DIMS = cfg.n_dims
-    if PLOT_DIMS:
-        # Use GridSpec with spacer rows for different vertical spacing
-        # Small gap between rows 1&2, large gap between rows 2&3 (for x-axis labels)
-        fig = plt.figure(figsize=(10, 16 if NUM_DIMS >= 3 else 6))
-        gs = GridSpec(5 if NUM_DIMS >= 3 else 1, 2, figure=fig,
-                      height_ratios=[1, 0.05, 1, 0.6, 1] if NUM_DIMS >= 3 else [1],
-                      hspace=0.01,
-                      wspace=0.15)
 
-        axes = np.empty((3 if NUM_DIMS >= 3 else 1, 2), dtype=object)
-        axes[0, 0] = fig.add_subplot(gs[0, 0])
-        axes[0, 1] = fig.add_subplot(gs[0, 1])
-        if NUM_DIMS >= 3:
-            axes[1, 0] = fig.add_subplot(gs[2, 0])
-            axes[1, 1] = fig.add_subplot(gs[2, 1])
-            # Rows 1 and 3 of GridSpec are spacers (no axes)
-            axes[2, 0] = fig.add_subplot(gs[4, 0])
-            axes[2, 1] = fig.add_subplot(gs[4, 1])
-
+    if PLOT_TRAJECTORIES or PLOT_POTENTIAL_LANDSCAPES:
         n_dims = cfg.n_dims
         target_df = target_df.sort(['filter_value', 'createtime']) \
             .with_columns([
@@ -915,48 +872,38 @@ def main(cfg):
             .drop([f'dim_{i}' for i in range(n_dims)])
 
         target_df = filter_df_to_time_range(target_df, trange)
-        
+
+    if PLOT_TRAJECTORIES:
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+
         for user_target_df in target_df.partition_by('filter_value'):
-            all_dims = [(0,1)]
-            if NUM_DIMS >= 3:
-                all_dims += [(0,2), (1,2)]
-            for idx, dims in enumerate(all_dims):
-                axes[idx,0].plot(
-                    user_target_df[f'coord_{cfg.n_dims}d'].arr.get(dims[0]),
-                    user_target_df[f'coord_{cfg.n_dims}d'].arr.get(dims[1]),
-                    alpha=0.1
-                )
+            ax.plot(
+                user_target_df[f'coord_{cfg.n_dims}d'].arr.get(0),
+                user_target_df[f'coord_{cfg.n_dims}d'].arr.get(1),
+                alpha=0.1
+            )
 
-        ax_idxs = [0]
-        dim_1s = [0]
-        dim_2s = [1]
-        if NUM_DIMS >= 3:
-            ax_idxs.extend([1,2])
-            dim_1s.extend([0,1])
-            dim_2s.extend([2,2])
+        setup_x_axis_labels(ax, components, stance_cols, dim_1=0)
+        show_x_dim_labels(ax, dimension_labels, dim=0)
+        setup_y_axis_labels(ax, components, stance_cols, dim_2=1)
+        show_y_dim_labels(ax, dimension_labels, dim=1)
 
-        for ax_idx, dim_1, dim_2 in zip(ax_idxs, dim_1s, dim_2s):
-            if NUM_DIMS >= 3 and ax_idx == 0: # don't show x-axis labels on first row because it shares xaxis with 2nd row
-                axes[ax_idx,0].set_xticks([])
-            else:
-                setup_x_axis_labels(axes[ax_idx,0], components, stance_cols, dim_1=dim_1)
-                show_x_dim_labels(axes[ax_idx,0], dimension_labels, dim=dim_1)
+        x_range = (np.percentile(coords[:,0], 0.5), np.percentile(coords[:,0], 99.5))
+        y_range = (np.percentile(coords[:,1], 0.5), np.percentile(coords[:,1], 99.5))
+        ax.set_xlim(x_range)
+        ax.set_ylim(y_range)
+        ax.set_box_aspect(1)
 
-            setup_y_axis_labels(axes[ax_idx,0], components, stance_cols, dim_2=dim_2)
-            show_y_dim_labels(axes[ax_idx,0], dimension_labels, dim=dim_2)
-            
-            x_range = (np.percentile(coords[:,dim_1], 0.5), np.percentile(coords[:,dim_1], 99.5))
-            y_range = (np.percentile(coords[:,dim_2], 0.5), np.percentile(coords[:,dim_2], 99.5))
-            axes[ax_idx,0].set_xlim(x_range)
-            axes[ax_idx,0].set_ylim(y_range)
-            axes[ax_idx,0].set_box_aspect(1)
+        fig.savefig(f'{fig_path}/nn_potential_trajectories.png', dpi=150, bbox_inches='tight', pad_inches=0.2)
+
+    if PLOT_POTENTIAL_LANDSCAPES and NUM_DIMS >= 3:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        dim_configs = [(0, 1), (0, 2), (1, 2)]
 
         # Pre-compute flow and variance magnitudes for global normalization (single model, marginalized)
         all_flow_magnitudes = []
         all_variance_magnitudes = []
-        dim_configs = [(0, 1)]
-        if NUM_DIMS >= 3:
-            dim_configs.extend([(0, 2), (1, 2)])
 
         t_mid = (trange[0] + trange[1]) / 2.0
         for dim_1, dim_2 in tqdm(dim_configs, desc="Pre-computing flow (dims)"):
@@ -985,45 +932,32 @@ def main(cfg):
         all_vars = np.concatenate([m.flatten() for m in all_variance_magnitudes])
         variance_levels, hatch_patterns = build_global_variance_levels(all_vars)
 
-        # Plot right column with global flow normalization
         plot_kwargs['show_colorbar'] = False
         plot_kwargs['show_legend'] = False
-        plot_kwargs['show_y_tick_labels'] = False
-        plot_kwargs['show_y_axis_labels'] = False
         plot_kwargs['max_flow'] = global_max
         plot_kwargs['min_flow'] = global_min
         plot_kwargs['variance_levels'] = variance_levels
         plot_kwargs['hatch_patterns'] = hatch_patterns
-        if NUM_DIMS >= 3:
-            plot_kwargs['show_x_tick_labels'] = False
-            plot_kwargs['show_x_axis_labels'] = False
+        plot_kwargs['show_x_tick_labels'] = True
+        plot_kwargs['show_x_axis_labels'] = True
 
-        plot_density_streamplot(fig, axes[0,1], model, target_df, components, stance_cols, **plot_kwargs)
-
-        if NUM_DIMS >= 3:
-            plot_kwargs['show_x_tick_labels'] = True
-            plot_kwargs['show_x_axis_labels'] = True
-            x_range = (np.percentile(coords[:,0], 0.5), np.percentile(coords[:,0], 99.5))
-            y_range = (np.percentile(coords[:,2], 0.5), np.percentile(coords[:,2], 99.5))
+        for i, (dim_1, dim_2) in enumerate(dim_configs):
+            x_range = (np.percentile(coords[:, dim_1], 0.5), np.percentile(coords[:, dim_1], 99.5))
+            y_range = (np.percentile(coords[:, dim_2], 0.5), np.percentile(coords[:, dim_2], 99.5))
             plot_kwargs['xrange'] = x_range
             plot_kwargs['yrange'] = y_range
+            plot_kwargs['show_y_tick_labels'] = (i == 0)
+            plot_kwargs['show_y_axis_labels'] = (i == 0)
 
-            plot_density_streamplot(fig, axes[1,1], model, target_df, components, stance_cols, dim_1=0, dim_2=2, **plot_kwargs)
+            plot_density_streamplot(fig, axes[i], model, target_df, components, stance_cols,
+                                    dim_1=dim_1, dim_2=dim_2, **plot_kwargs)
 
-            x_range = (np.percentile(coords[:,1], 0.5), np.percentile(coords[:,1], 99.5))
-            y_range = (np.percentile(coords[:,2], 0.5), np.percentile(coords[:,2], 99.5))
-            plot_kwargs['xrange'] = x_range
-            plot_kwargs['yrange'] = y_range
-
-            plot_density_streamplot(fig, axes[2,1], model, target_df, components, stance_cols, dim_1=1, dim_2=2, **plot_kwargs)
-
-        # Add shared legend on top-right axes, partially outside
         global_flow_percentiles = (global_min, global_p25, global_p50, global_p75, global_max)
-        add_legend(axes[0,1], flow_percentiles=global_flow_percentiles,
-                   bbox_to_anchor=(1.2, 1.2))
+        add_legend(axes[-1], flow_percentiles=global_flow_percentiles,
+                   bbox_to_anchor=(1.4, 1.0))
 
-        fig.savefig(f'{fig_path}/nn_potential_2d_projections.png', dpi=150, bbox_inches='tight', pad_inches=0.2)
-        
+        fig.savefig(f'{fig_path}/nn_potential_landscape_row.png', dpi=150, bbox_inches='tight', pad_inches=0.2)
+
     
 if __name__ == '__main__':
     main()  

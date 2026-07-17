@@ -238,6 +238,7 @@ def compute_aggregate_stance_changes(
     movers_df: pl.DataFrame,
     targets: list,
     filter_col: str,
+    movement_direction: str = 'positive',
     n_top_targets: int = 3,
     significance_threshold: float = 0.05,
     min_observations: int = 10
@@ -300,20 +301,34 @@ def compute_aggregate_stance_changes(
     # Compute significance per target
     significance_df = compute_target_significance(stance_counts, min_observations)
 
-    # Weight ranking by loading magnitude to prefer targets that load heavily on the dimension
+    # Compute general stance shift per target (FAVOR_change - AGAINST_change)
+    movement_sign = 1 if movement_direction == 'positive' else -1
+    stance_shift = changes_df \
+        .with_columns(
+            pl.col('Stance').replace_strict(
+                {'FAVOR': 1.0, 'NEUTRAL': 0.0, 'AGAINST': -1.0}, default=0.0
+            ).alias('stance_weight')
+        ) \
+        .with_columns((pl.col('change') * pl.col('stance_weight')).alias('weighted_change_dir')) \
+        .group_by('Target') \
+        .agg(pl.col('weighted_change_dir').sum().alias('stance_shift'))
+
+    # Weight ranking by loading magnitude, filtering to targets where stance change
+    # aligns with expected direction (sign of movement * loading)
     valid_targets = changes_df \
         .group_by('Target') \
         .agg([
             pl.col('early_n').sum().alias('total_early'),
             pl.col('late_n').sum().alias('total_late'),
-            pl.col('change').abs().max().alias('max_abs_change')
         ]) \
         .filter((pl.col('total_early') > 0) & (pl.col('total_late') > 0)) \
         .join(significance_df, on='Target') \
         .filter(pl.col('p_value') < significance_threshold) \
         .join(target_info_df.select(['Target', 'loading']), on='Target') \
-        .with_columns((pl.col('max_abs_change') * pl.col('loading').abs()).alias('weighted_change')) \
-        .sort('weighted_change', descending=True) \
+        .join(stance_shift, on='Target', how='left') \
+        .with_columns(pl.col('stance_shift').fill_null(0.0)) \
+        .filter(pl.col('stance_shift') * pl.col('loading') * movement_sign >= 0) \
+        .sort(pl.col('loading').abs() / pl.col('p_value'), descending=True) \
         .head(n_top_targets)
 
     if valid_targets.height == 0:
@@ -354,6 +369,7 @@ def analyze_dimension_movements(
     components: np.ndarray,
     stance_cols: list,
     filter_col: str,
+    platforms=None,
     n_dims: int = 3,
     years: list = [2022, 2023, 2024, 2025],
     n_top_movers: int = 3,
@@ -433,7 +449,8 @@ def analyze_dimension_movements(
                     pct_movers = get_percentile_movers(period_movement, direction, pct)
                     pct_label = f'top_{int(pct * 100)}pct'
                     agg_stance_changes = compute_aggregate_stance_changes(
-                        text_df, pct_movers, heavy_targets, filter_col
+                        text_df, pct_movers, heavy_targets, filter_col,
+                        movement_direction=direction
                     )
                     results[dim_name][period_key][f'{direction}_{pct_label}'] = {
                         'n_users': pct_movers.height,
@@ -479,32 +496,32 @@ def print_analysis_results(results: dict, title: str = None):
             # for t in heavy_targets:
             #     print(f"  • {t['target']}: loading={t['loading']:.4f} ({t['direction']})")
 
-            for direction in ['positive', 'negative']:
-                movers = year_data.get(direction, [])
-                dir_label = "POSITIVE" if direction == 'positive' else "NEGATIVE"
-                print(f"\nTop {dir_label} movers with significant pooled stance changes:")
+            # for direction in ['positive', 'negative']:
+            #     movers = year_data.get(direction, [])
+            #     dir_label = "POSITIVE" if direction == 'positive' else "NEGATIVE"
+            #     print(f"\nTop {dir_label} movers with significant pooled stance changes:")
 
-                if not movers:
-                    print("  No movers with significant stance changes found")
-                    continue
+            #     if not movers:
+            #         print("  No movers with significant stance changes found")
+            #         continue
 
-                for i, mover in enumerate(movers, 1):
-                    print(f"\n  {i}. {mover['filter_value']}")
-                    print(f"     Movement: {mover['movement']:.4f} ({mover['start_value']:.4f} → {mover['end_value']:.4f})")
-                    print(f"     Observations: {mover['n_observations']}")
+            #     for i, mover in enumerate(movers, 1):
+            #         print(f"\n  {i}. {mover['filter_value']}")
+            #         print(f"     Movement: {mover['movement']:.4f} ({mover['start_value']:.4f} → {mover['end_value']:.4f})")
+            #         print(f"     Observations: {mover['n_observations']}")
 
-                    stance_changes = mover.get('stance_changes', {})
-                    if stance_changes:
-                        print(f"     Pooled stance changes by loading direction:")
-                        for group_key, group_data in stance_changes.items():
-                            dir_label = group_data['loading_direction'].upper()
-                            print(f"       {dir_label}-loading targets ({group_data['n_targets']} targets, n_early={group_data['early_n']}, n_late={group_data['late_n']}, p={group_data['p_value']:.4f}):")
-                            for stance in sorted(group_data['stance_changes'], key=lambda s: (STANCE_ORDER.index(s) if s in STANCE_ORDER else len(STANCE_ORDER))):
-                                change_data = group_data['stance_changes'][stance]
-                                change_str = f"+{change_data['change']:.1f}" if change_data['change'] >= 0 else f"{change_data['change']:.1f}"
-                                print(f"         {stance}: {change_data['early_pct']:.1f}% → {change_data['late_pct']:.1f}% ({change_str}%)")
-                    else:
-                        print(f"     No significant stance changes on heavy-loading targets")
+            #         stance_changes = mover.get('stance_changes', {})
+            #         if stance_changes:
+            #             print(f"     Pooled stance changes by loading direction:")
+            #             for group_key, group_data in stance_changes.items():
+            #                 dir_label = group_data['loading_direction'].upper()
+            #                 print(f"       {dir_label}-loading targets ({group_data['n_targets']} targets, n_early={group_data['early_n']}, n_late={group_data['late_n']}, p={group_data['p_value']:.4f}):")
+            #                 for stance in sorted(group_data['stance_changes'], key=lambda s: (STANCE_ORDER.index(s) if s in STANCE_ORDER else len(STANCE_ORDER))):
+            #                     change_data = group_data['stance_changes'][stance]
+            #                     change_str = f"+{change_data['change']:.1f}" if change_data['change'] >= 0 else f"{change_data['change']:.1f}"
+            #                     print(f"         {stance}: {change_data['early_pct']:.1f}% → {change_data['late_pct']:.1f}% ({change_str}%)")
+            #         else:
+            #             print(f"     No significant stance changes on heavy-loading targets")
 
             # Print percentile group summaries
             for direction in ['positive', 'negative']:
@@ -529,6 +546,69 @@ def print_analysis_results(results: dict, title: str = None):
                     else:
                         print(f"    No significant stance changes")
 
+def write_latex_table(results: dict, output_path: str):
+    """Write stance change results as a LaTeX table with columns: Percentile, Target, FAVOR, NEUTRAL, AGAINST."""
+    rows = []
+    for dim_name, dim_data in results.items():
+        for period_key, year_data in sorted(dim_data.items()):
+            if period_key == 'heavy_targets':
+                continue
+
+            for direction in ['positive', 'negative']:
+                dir_label = "Pos." if direction == 'positive' else "Neg."
+                for key, pct_data in sorted(year_data.items()):
+                    if not key.startswith(f'{direction}_top_'):
+                        continue
+
+                    pct_num = int(key.replace(f'{direction}_top_', '').replace('pct', ''))
+                    if direction == 'negative':
+                        pct_label = f"$<{pct_num}$\\%"
+                    else:
+                        pct_label = f"$>{100 - pct_num}$\\%"
+                    if period_key == 'all_time':
+                        pct_col = f"{dim_name} {pct_label}"
+                    else:
+                        pct_col = f"{dim_name} {period_key} {pct_label}"
+
+                    stance_changes = pct_data.get('stance_changes', {})
+                    for target, target_data in stance_changes.items():
+                        change_vals = {}
+                        for stance, change_data in target_data['stance_changes'].items():
+                            change_vals[stance] = (change_data['early_pct'], change_data['late_pct'])
+                        rows.append({
+                            'percentile': pct_col,
+                            'target': target,
+                            'changes': change_vals,
+                        })
+
+    if not rows:
+        return
+
+    lines = []
+    lines.append("\\begin{tabular}{llrrr}")
+    lines.append("\\toprule")
+    lines.append("Percentile & Target & Favor & Neutral & Against \\\\")
+    lines.append("\\midrule")
+    prev_percentile = None
+    for row in rows:
+        if prev_percentile is not None and row['percentile'] != prev_percentile:
+            lines.append("\\midrule")
+        prev_percentile = row['percentile']
+        vals = []
+        for stance in STANCE_ORDER:
+            early_pct, late_pct = row['changes'].get(stance, (0, 0))
+            val = f"{early_pct:.1f}→{late_pct:.1f}"
+            vals.append(val)
+        target_escaped = row['target'].replace('_', '\\_').replace('&', '\\&')
+        lines.append(f"{row['percentile']} & {target_escaped} & {vals[0]} & {vals[1]} & {vals[2]} \\\\")
+    lines.append("\\bottomrule")
+    lines.append("\\end{tabular}")
+
+    with open(output_path, 'w') as f:
+        f.write('\n'.join(lines))
+    logger.info(f"LaTeX table written to {output_path}")
+
+
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(cfg):
     logging.basicConfig(level=logging.INFO)
@@ -537,35 +617,32 @@ def main(cfg):
     trend_path = cfg.trend_path
     trend_name = os.path.basename(trend_path.rstrip('/'))
 
-    target_path = os.path.join(trend_path, f'{cfg.dim_reduction_method}_coords.parquet.zstd')
-    target_head_df = pl.read_parquet(target_path, n_rows=1)
-    target_df = pl.read_parquet(target_path, columns=['createtime', 'filter_value', 'coord_21d'])
+    target_head_df = pl.read_parquet(os.path.join(trend_path, f'pivoted_and_imputed.parquet.zstd'), n_rows=1)
+    target_df = pl.read_parquet(os.path.join(trend_path, f'{cfg.dim_reduction_method}_coords.parquet.zstd'))
 
     target_df = target_df.filter(pl.col('createtime') >= datetime.datetime(2022, 1, 1))
 
     # Apply rolling average to smooth coordinates
-    n_dims = 21
-    target_df = target_df \
-        .sort(['filter_value', 'createtime']) \
+    coords_col = [col for col in target_df.columns if col.startswith('coord_')][0]
+    n_dims = target_df[coords_col][0].shape[0]
+    target_df = target_df.sort(['filter_value', 'createtime']) \
         .with_columns([
-            pl.col('coord_21d').arr.get(i).alias(f'dim_{i}') for i in range(n_dims)
+            pl.col(coords_col).arr.get(i).alias(f'dim_{i}') for i in range(n_dims)
         ]) \
-        .with_columns([
-            pl.col(f'dim_{i}').rolling_mean(cfg.rolling_mean_window).over('filter_value') for i in range(n_dims)
-        ]) \
+        .rolling('createtime', period=f'{cfg.rolling_mean_window}d', group_by='filter_value') \
+        .agg([pl.col(f'dim_{i}').mean() for i in range(n_dims)]) \
         .with_columns(
             pl.concat_arr([f'dim_{i}' for i in range(n_dims)]).alias('coord_21d')
         ) \
-        .drop([f'dim_{i}' for i in range(n_dims)]) \
-        .drop_nulls('coord_21d')
+        .drop([f'dim_{i}' for i in range(n_dims)])
 
     component_df = pl.read_parquet(os.path.join(trend_path, f'{cfg.dim_reduction_method}_metadata.parquet.zstd'))
     stance_cols = [col for col in target_head_df.columns if col not in ['createtime', 'filter_value', 'coord_21d']]
 
     if cfg.dim_reduction_method == 'sfa':
-        components = component_df.filter(pl.col('n_components') == 21)['W'][0].to_numpy()
-    elif cfg.dim_reduction_method == 'pca':
-        components = np.stack(component_df.filter(pl.col('n_dims') == 21)['components'][0].to_numpy())
+        components = component_df.filter(pl.col('n_components') == n_dims)['W'][0].to_numpy()
+    elif cfg.dim_reduction_method in ['pca', 'ppca']:
+        components = np.stack(component_df.filter(pl.col('n_dims') == n_dims)['components'][0].to_numpy())
     else:
         raise ValueError(f"Unknown dim_reduction_method: {cfg.dim_reduction_method}")
 
@@ -575,36 +652,70 @@ def main(cfg):
     text_df = load_text_df(cfg)
     text_df = text_df.with_columns(pl.col('seed').struct.field(cfg.filter_column)).drop('seed')
 
-    logger.info("Analyzing per-year movements (2 dimensions)...")
-    per_year_results = analyze_dimension_movements(
-        target_df=target_df,
-        text_df=text_df,
-        components=components,
-        stance_cols=stance_cols,
-        filter_col=cfg.filter_column,
-        n_dims=2,
-        years=[2022, 2023, 2024, 2025],
-        n_top_movers=3,
-        n_heavy_targets=100,
-        per_year=True
-    )
-    print_analysis_results(per_year_results, title="PER-YEAR ANALYSIS (PC1-PC2)")
+    if cfg.filter_column == 'SeedName':
+        logger.info("Analyzing per-year movements (2 dimensions)...")
+        per_year_results = analyze_dimension_movements(
+            target_df=target_df,
+            text_df=text_df,
+            components=components,
+            stance_cols=stance_cols,
+            filter_col=cfg.filter_column,
+            n_dims=2,
+            years=[2022, 2023, 2024, 2025],
+            n_top_movers=3,
+            n_heavy_targets=100,
+            per_year=True
+        )
+        print_analysis_results(per_year_results, title="PER-YEAR ANALYSIS (PC1-PC2)")
+        for year in [2022, 2023, 2024, 2025]:
+            year_results = {dim: {k: v for k, v in data.items() if k == year} for dim, data in per_year_results.items()}
+            write_latex_table(year_results, f'./out/per_year_stance_changes_{year}.tex')
 
-    logger.info("Analyzing all-time movements (3 dimensions)...")
-    all_time_results = analyze_dimension_movements(
-        target_df=target_df,
-        text_df=text_df,
-        components=components,
-        stance_cols=stance_cols,
-        filter_col=cfg.filter_column,
-        n_dims=3,
-        n_top_movers=3,
-        n_heavy_targets=100,
-        per_year=False
-    )
-    print_analysis_results(all_time_results, title="ALL-TIME ANALYSIS (PC1-PC3)")
+        logger.info("Analyzing all-time movements (3 dimensions)...")
+        all_time_results = analyze_dimension_movements(
+            target_df=target_df,
+            text_df=text_df,
+            components=components,
+            stance_cols=stance_cols,
+            filter_col=cfg.filter_column,
+            n_dims=3,
+            n_top_movers=3,
+            n_heavy_targets=100,
+            per_year=False
+        )
+        print_analysis_results(all_time_results, title="ALL-TIME ANALYSIS (PC1-PC3)")
+        write_latex_table(all_time_results, './out/all_time_stance_changes.tex')
+    elif cfg.filter_column == 'PlatformHandleID':
+        for platform in ['twitter', 'instagram', 'bluesky', 'tiktok']:
+            platform_target_df = target_df.filter(
+                pl.col('filter_value').cast(pl.String)\
+                    .str.to_lowercase()\
+                    .str.contains(f'-{platform}-')
+            )
+            platform_text_df = text_df.filter(
+                pl.col(cfg.filter_column).cast(pl.String)\
+                    .str.to_lowercase()\
+                    .str.contains(f'-{platform}-')
+            )
 
+            if platform_target_df.height == 0:
+                logger.info(f"No data for platform {platform}, skipping")
+                continue
 
+            logger.info(f"Analyzing {platform} movements (2 dimensions)...")
+            platform_results = analyze_dimension_movements(
+                target_df=platform_target_df,
+                text_df=platform_text_df,
+                components=components,
+                stance_cols=stance_cols,
+                filter_col=cfg.filter_column,
+                n_dims=2,
+                n_top_movers=3,
+                n_heavy_targets=100,
+                per_year=False
+            )
+            print_analysis_results(platform_results, title=f"{platform.upper()} PLATFORM ANALYSIS (PC1-PC2)")
+            write_latex_table(platform_results, f'./out/{platform}_platform_stance_changes.tex')
 
 if __name__ == '__main__':
     main()

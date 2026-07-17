@@ -15,8 +15,8 @@ def plot_fig(axes, pca_df):
     for ax_idx, window_size in zip([1, 2, 3], [50, 100, 200]):
         for user_target_df in pca_df.partition_by('filter_value'):
             axes[ax_idx].plot(
-                user_target_df['coord'].arr.get(0).rolling_mean(window_size),
-                user_target_df['coord'].arr.get(1).rolling_mean(window_size),
+                user_target_df['coord'].arr.get(0).rolling_mean(window_size, min_samples=1),
+                user_target_df['coord'].arr.get(1).rolling_mean(window_size, min_samples=1),
                 alpha=0.1
             )
         axes[ax_idx].set_title(f'PCA Trajectories (MA {window_size})')

@@ -12,7 +12,7 @@ import scipy.spatial
 from scipy.stats import gaussian_kde
 from tqdm import tqdm
 
-def load_df(dir_path, filter_type, group_by_every='2d', min_filter_count=10, keywords=None):
+def load_df(dir_path, filter_type, group_by_every='2d', min_filter_count=10, targets=None, keywords=None):
     target_file_paths = [os.path.join(dir_path, target_file_name) for target_file_name in os.listdir(dir_path) if target_file_name.endswith('trends.parquet.zstd') and not target_file_name.startswith('loaded_trends')]
     dfs = []
     for target_path in tqdm(target_file_paths, desc="Loading data files"):
@@ -25,14 +25,19 @@ def load_df(dir_path, filter_type, group_by_every='2d', min_filter_count=10, key
                     pl.col('target').first(), 
                     pl.col('filter_type').first()
                 ])
-            file_df = file_df.join(
-                file_df.group_by('filter_value')\
-                    .agg(pl.col('volume').sum())\
-                    .filter(pl.col('volume') > min_filter_count)\
-                    .select(['filter_value']), 
-                on='filter_value', 
-                how='inner'
-            )
+            if min_filter_count is not None:
+                file_df = file_df.join(
+                    file_df.group_by('filter_value')\
+                        .agg(pl.col('volume').sum())\
+                        .filter(pl.col('volume') > min_filter_count)\
+                        .select(['filter_value']), 
+                    on='filter_value', 
+                    how='inner'
+                )
+            elif targets is not None:
+                file_df = file_df.filter(pl.col('target').is_in(targets))
+            else:
+                raise ValueError("Either min_filter_count or targets must be specified")
             dfs.append(file_df)
         except Exception as e:
             print(f"Error loading {target_path}: {e}")
@@ -84,9 +89,6 @@ def format_pca_axis_label(component_num, top_features, max_chars=100):
 
 def create_kde_background(coords, ax, alpha=0.3, levels=10, x_min=None, x_max=None, y_min=None, y_max=None):
     """Create kernel density estimation background with logarithmic scaling"""
-    if len(coords) == 0:
-        return None, (None, None)
-    
     x_coords, y_coords = coords[:, 0], coords[:, 1]
     
     # Create a grid for KDE evaluation
@@ -471,26 +473,35 @@ def plot_by_platform(target_df, components, feature_names):
     plt.tight_layout()
     return fig
 
-def pivot_and_impute(df, impute_fancy=False):
-
-    print("Pivoting and preparing data...")
+def pivot_trends(df, missing_cols=None):
+    print("Pivoting data...")
     df = df.with_columns([
         pl.col('trend_mean').cast(pl.Float32),
         pl.col('filter_value').cast(pl.Enum(df['filter_value'].unique()))
     ])
     target_df = df.pivot(on='target', index=['createtime', 'filter_value'], values=['trend_mean'])
-    
-    # Get feature columns
+
     stance_cols = [c for c in target_df.columns if c not in ['createtime', 'filter_value']]
 
-    print("Imputing missing values...")
-    # replace completely missing values with mean
+    if missing_cols is not None:
+        for col in missing_cols:
+            target_df = target_df.with_columns(pl.lit(np.nan).alias(col))
+        stance_cols = stance_cols + missing_cols
+
+    # Forward/backward fill within each filter_value
     target_df = target_df.with_columns(
         [pl.col(c).backward_fill().over('filter_value') for c in stance_cols]
     ).with_columns(
         [pl.col(c).forward_fill().over('filter_value') for c in stance_cols]
     )
 
+    return target_df, stance_cols
+
+
+def pivot_and_impute(df, missing_cols=None, impute_fancy=False):
+    target_df, stance_cols = pivot_trends(df, missing_cols=missing_cols)
+
+    print("Imputing missing values...")
     if impute_fancy:
         X = target_df.select(stance_cols).to_numpy().astype(np.float32)
 
@@ -501,7 +512,7 @@ def pivot_and_impute(df, impute_fancy=False):
         rank = np.power(X.shape[1], 1/3).astype(int) # rough heuristic for rank
 
         from fancyimpute import IterativeSVD
-        imp = IterativeSVD(rank=rank)
+        imp = IterativeSVD(rank=rank, svd_algorithm="arpack")
         X_imputed = imp.fit_transform(X)
 
         target_df = target_df.with_columns([

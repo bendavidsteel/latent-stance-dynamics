@@ -128,7 +128,7 @@ def main(cfg):
 
     target_df = target_df \
         .with_columns([pl.col('x0').arr.get(i).alias(f'x0_{i}') for i in range(n_pca_dims)]) \
-        .with_columns([pl.col(f'x0_{i}').rolling_mean(cfg.rolling_mean_window).over('filter_value') for i in range(n_pca_dims)]) \
+        .with_columns([pl.col(f'x0_{i}').rolling_mean(cfg.rolling_mean_window, min_samples=1).over('filter_value') for i in range(n_pca_dims)]) \
         .drop_nulls([f'x0_{i}' for i in range(n_pca_dims)])
 
     # Partition into separate trajectories by filter_value

@@ -7,8 +7,8 @@ def main():
     platform_data_path = './data/stance_targets/platform_handle_noun_phrase_bkrr_trends'
     output_path = './out/dataset_table.tex'
 
-    seed_df = pl.read_parquet(os.path.join(seed_data_path, 'loaded_trends.parquet.zstd'))
-    platform_df = pl.read_parquet(os.path.join(platform_data_path, 'loaded_trends.parquet.zstd'))
+    seed_df = pl.read_parquet(os.path.join(seed_data_path, 'loaded_trends.parquet.zstd'), columns=['filter_value', 'volume'])
+    platform_df = pl.read_parquet(os.path.join(platform_data_path, 'loaded_trends.parquet.zstd'), columns=['filter_value', 'volume'])
 
     total_num_posts = seed_df['volume'].sum()
     total_num_users = seed_df['filter_value'].n_unique()
@@ -34,7 +34,8 @@ def main():
             f.write(f"{platform} & {num_posts:,} & {num_users:,} \\\\\n")
 
         f.write("\\midrule\n")
-        f.write(f"Total & {total_num_posts:,} & {total_num_users:,} \\\\\n")
+        f.write("& Num Posts & Num People \\\\\n")
+        f.write(f" & {total_num_posts:,} & {total_num_users:,} \\\\\n")
         f.write("\\bottomrule\n")
         f.write("\\end{tabular}\n")
         f.write("\\caption{Dataset statistics by platform.}\n")

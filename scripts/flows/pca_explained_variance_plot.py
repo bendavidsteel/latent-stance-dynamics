@@ -11,22 +11,23 @@ def main(cfg):
     trend_path = cfg.trend_path
 
     target_path = os.path.join(trend_path, f'{cfg.dim_reduction_method}_coords.parquet.zstd')
-    target_df = pl.read_parquet(target_path, columns=['createtime', 'filter_value', 'coord_21d'])
+    target_df = pl.read_parquet(target_path)
 
     target_df = target_df.filter(pl.col('createtime') >= datetime.datetime(2022, 1, 1))\
         .filter(pl.col('filter_value') != '')
 
+    coord_col = [col for col in target_df.columns if col.startswith('coord_')][0]
+    num_dims = target_df.select(pl.col(coord_col).arr.len()).item(0, 0)
+
     # get var(diff(coord)) for each dimension
     coord_diff_var = target_df.sort(['filter_value', 'createtime'])\
         .with_columns([
-            pl.col('coord_21d').arr.get(i).diff().over('filter_value').alias(f'dim_{i}_diff') for i in range(21)
+            pl.col(coord_col).arr.get(i).diff().over('filter_value').alias(f'dim_{i}_diff') for i in range(num_dims)
         ])\
-        .select([pl.col(f'dim_{i}_diff').var() for i in range(21)])\
+        .select([pl.col(f'dim_{i}_diff').var() for i in range(num_dims)])\
         .to_numpy()[0]
 
-    num_dims = 10
-
-    pca_metadata_df = pl.read_parquet(os.path.join(trend_path, 'pca_metadata.parquet.zstd'))
+    pca_metadata_df = pl.read_parquet(os.path.join(trend_path, f'{cfg.dim_reduction_method}_metadata.parquet.zstd'))
     explained_variance_ratios = pca_metadata_df.sort('n_dims')['explained_variance_ratio'][-1].to_numpy()
     explained_variance_ratios = explained_variance_ratios[:num_dims]
     n_dims = np.arange(1, num_dims + 1)
@@ -35,7 +36,8 @@ def main(cfg):
     cum_sum = np.cumsum(explained_variance_ratios)
 
     print(f"2 components explain {cum_sum[1]:.2%} of variance")
-    print(f"10 components explain {cum_sum[9]:.2%} of variance")
+    if num_dims >= 10:
+        print(f"10 components explain {cum_sum[9]:.2%} of variance")
 
     fig, ax = plt.subplots(figsize=(5, 4))
     ax_twin = ax.twinx()

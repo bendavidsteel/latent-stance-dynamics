@@ -21,12 +21,12 @@ def load_text_df(cfg, columns=['id', 'createtime', 'seed', 'Document', 'Targets'
     df = pl.read_parquet([os.path.join(dir_path, file_name) for file_name in os.listdir(dir_path) if file_name.endswith('.parquet.zstd')], columns=columns)
     return df
 
-def get_user_documents(df: pl.DataFrame, text_df: pl.DataFrame, pca_feature_df: pl.DataFrame, direction, filter_val_col):
+def get_user_documents(df: pl.DataFrame, text_df: pl.DataFrame, pca_feature_df: pl.DataFrame, direction, filter_val_col, n_exemplars=32):
     pca_feature_df = pca_feature_df.with_columns([
         pl.col('Target').str.replace('trend_mean_', ''),
         pl.col('Loading').sign()
     ])
-    return df.group_by('filter_value')\
+    return_df = df.group_by('filter_value')\
         .agg([
             pl.col('createtime').min().alias('start_date'),
             pl.col('createtime').max().alias('end_date')
@@ -43,6 +43,20 @@ def get_user_documents(df: pl.DataFrame, text_df: pl.DataFrame, pca_feature_df: 
             (pl.col('start_date') <= pl.col('createtime')) & \
             (pl.col('end_date') >= pl.col('createtime'))
         )
+    if len(return_df) < n_exemplars:
+        return_df = df.group_by('filter_value')\
+            .agg([
+                pl.col('createtime').min().alias('start_date'),
+                pl.col('createtime').max().alias('end_date')
+            ])\
+            .join_where(
+                text_df.explode(['Targets', 'Stances'])\
+                    .rename({'Targets': 'Target', 'Stances': 'Stance'}),
+                (pl.col('filter_value') == pl.col(filter_val_col)) & \
+                (pl.col('start_date') <= pl.col('createtime')) & \
+                (pl.col('end_date') >= pl.col('createtime'))
+            )
+    return return_df
 
 
 def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_features: list, text_df: pl.DataFrame,
@@ -67,16 +81,18 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
         neutral_df = target_df.filter((pl.col(dim_col) < positive_threshold) & (pl.col(dim_col) > negative_threshold))
 
         # Join with text data to get documents
-        v_pos_text_df = get_user_documents(v_pos_df, text_df, pca_feature_df, 1, filter_val_col)\
+        v_pos_text_df = get_user_documents(v_pos_df, text_df, pca_feature_df, 1, filter_val_col, n_exemplars)\
             .with_columns(pl.lit(0).alias('Topic'))
-        v_neg_text_df = get_user_documents(v_neg_df, text_df, pca_feature_df, -1, filter_val_col)\
+        v_neg_text_df = get_user_documents(v_neg_df, text_df, pca_feature_df, -1, filter_val_col, n_exemplars)\
             .with_columns(pl.lit(1).alias('Topic'))
-        pos_text_df = get_user_documents(pos_df, text_df, pca_feature_df, 1, filter_val_col)\
+        pos_text_df = get_user_documents(pos_df, text_df, pca_feature_df, 1, filter_val_col, n_exemplars)\
             .with_columns(pl.lit(2).alias('Topic'))
-        neg_text_df = get_user_documents(neg_df, text_df, pca_feature_df, -1, filter_val_col)\
+        neg_text_df = get_user_documents(neg_df, text_df, pca_feature_df, -1, filter_val_col, n_exemplars)\
             .with_columns(pl.lit(3).alias('Topic'))
-        neutral_text_df = get_user_documents(neutral_df, text_df, pca_feature_df, 0, filter_val_col)\
+        neutral_text_df = get_user_documents(neutral_df, text_df, pca_feature_df, 0, filter_val_col, n_exemplars)\
             .with_columns(pl.lit(4).alias('Topic'))
+        
+        assert min(len(v_pos_text_df), len(v_neg_text_df), len(pos_text_df), len(neg_text_df), len(neutral_text_df)) > n_exemplars, "Insufficient documents in one of the categories to select exemplars from. Consider reducing the number of categories or lowering the percentile thresholds."
 
         # Combine for ctfidf calculation and join with embeddings
         cols = ['id', 'Document', 'Topic']
@@ -98,8 +114,8 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
             {neutral_text_df.shape[0]} neutral docs""")
     elif num_cats == 3:
         # Get thresholds for this dimension using polars
-        positive_threshold = target_df.select(pl.col(dim_col).quantile(0.9)).item()
-        negative_threshold = target_df.select(pl.col(dim_col).quantile(0.1)).item()
+        positive_threshold = target_df.select(pl.col(dim_col).quantile(0.95)).item()
+        negative_threshold = target_df.select(pl.col(dim_col).quantile(0.05)).item()
         mean_val = target_df.select(pl.col(dim_col).mean()).item()
 
         # Filter for positive and negative extremes using polars
@@ -108,12 +124,14 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
         neutral_df = target_df.filter((pl.col(dim_col) < positive_threshold) & (pl.col(dim_col) > negative_threshold))
 
         # Join with text data to get documents
-        pos_text_df = get_user_documents(pos_df, text_df, pca_feature_df, 1)\
+        pos_text_df = get_user_documents(pos_df, text_df, pca_feature_df, 1, filter_val_col, n_exemplars)\
             .with_columns(pl.lit(2).alias('Topic'))
-        neg_text_df = get_user_documents(neg_df, text_df, pca_feature_df, -1)\
+        neg_text_df = get_user_documents(neg_df, text_df, pca_feature_df, -1, filter_val_col, n_exemplars)\
             .with_columns(pl.lit(3).alias('Topic'))
-        neutral_text_df = get_user_documents(neutral_df, text_df, pca_feature_df, 0)\
+        neutral_text_df = get_user_documents(neutral_df, text_df, pca_feature_df, 0, filter_val_col, n_exemplars)\
             .with_columns(pl.lit(4).alias('Topic'))
+        
+        assert min(len(pos_text_df), len(neg_text_df), len(neutral_text_df)) > n_exemplars, "Insufficient documents in one of the categories to select exemplars from. Consider reducing the number of categories or lowering the percentile thresholds."
 
         # Combine for ctfidf calculation and join with embeddings
         cols = ['id', 'Document', 'Topic']
@@ -322,22 +340,22 @@ def get_dimension_descriptions(target_df: pl.DataFrame, pca_features, cfg):
     dimension_labels = {}
 
     # Set up LLM for topic naming
-    model_name = 'Qwen/Qwen3-4B-Instruct-2507'
+    model_name = 'google/gemma-4-E4B-it'
     llm = AsyncVLLMNamer(
         model=model_name,
-        max_model_len=11000,
+        max_model_len=16000,
     )
     # llm = None
 
-    num_cats = 5
+    num_cats = 3
     n_exemplars = 32
     n_keyphrases = 32
-    num_dims = 10
 
     for dim in range(num_dims):
         logging.info(f"\nProcessing dimension {dim}...")
 
         dim_pca_features = pca_features[f'PC{dim+1}']
+        dimension_labels[dim] = {}
 
         dim_desc = get_dimension_description(
             target_df,
@@ -346,13 +364,27 @@ def get_dimension_descriptions(target_df: pl.DataFrame, pca_features, cfg):
             text_df,
             embedding_model,
             llm,
-            num_cats=num_cats,
+            num_cats=3,
             n_exemplars=n_exemplars,
             n_keyphrases=n_keyphrases,
             exemplar_selection_method=exemplar_selection_method,
             filter_val_col=cfg.filter_column
         )
-        dimension_labels[dim] = dim_desc
+        dimension_labels[dim]['3_cat'] = dim_desc
+        dim_desc = get_dimension_description(
+            target_df,
+            dim,
+            dim_pca_features,
+            text_df,
+            embedding_model,
+            llm,
+            num_cats=5,
+            n_exemplars=n_exemplars,
+            n_keyphrases=n_keyphrases,
+            exemplar_selection_method=exemplar_selection_method,
+            filter_val_col=cfg.filter_column
+        )
+        dimension_labels[dim]['5_cat'] = dim_desc
 
     return dimension_labels
 
@@ -365,44 +397,43 @@ def main(cfg):
     keywords = None
     dir_name = f"{trend_name}/all"
 
-    target_path = os.path.join(trend_path, f'{cfg.dim_reduction_method}_coords.parquet.zstd')
-    target_head_df = pl.read_parquet(target_path, n_rows=1)
-    target_df = pl.read_parquet(target_path, columns=['createtime', 'filter_value', 'coord_21d'])
+    target_head_df = pl.read_parquet(os.path.join(trend_path, 'pivoted_and_imputed.parquet.zstd'), n_rows=1)
+    target_df = pl.read_parquet(os.path.join(trend_path, f'{cfg.dim_reduction_method}_coords.parquet.zstd'))
+    coord_col = [col for col in target_df.columns if col.startswith('coord_')][0]
 
     target_df = target_df.filter(pl.col('createtime') >= datetime.datetime(2022, 1, 1))
 
     # Apply rolling average to smooth coordinates
-    n_dims = 21
+    n_dims = target_df.schema[coord_col].shape[0]
     target_df = target_df \
         .sort(['filter_value', 'createtime']) \
         .with_columns([
-            pl.col('coord_21d').arr.get(i).alias(f'dim_{i}') for i in range(n_dims)
+            pl.col(coord_col).arr.get(i).alias(f'dim_{i}') for i in range(n_dims)
         ]) \
-        .with_columns([
-            pl.col(f'dim_{i}').rolling_mean(cfg.rolling_mean_window).over('filter_value') for i in range(n_dims)
-        ]) \
+        .rolling('createtime', period=f'{cfg.rolling_mean_window}d', group_by='filter_value') \
+        .agg([pl.col(f'dim_{i}').mean() for i in range(n_dims)]) \
         .with_columns(
-            pl.concat_arr([f'dim_{i}' for i in range(n_dims)]).alias('coord_21d')
+            pl.concat_arr([f'dim_{i}' for i in range(n_dims)]).alias(coord_col)
         ) \
         .drop([f'dim_{i}' for i in range(n_dims)]) \
-        .drop_nulls('coord_21d')
+        .drop_nulls(coord_col)
 
     # get var(diff(coord)) for each dimension
     coord_diff_var = target_df.sort(['filter_value', 'createtime'])\
         .with_columns([
-            pl.col('coord_21d').arr.get(i).diff().over('filter_value').alias(f'dim_{i}_diff') for i in range(21)
+            pl.col(coord_col).arr.get(i).diff().over('filter_value').alias(f'dim_{i}_diff') for i in range(n_dims)
         ])\
-        .select([pl.col(f'dim_{i}_diff').var() for i in range(21)])\
+        .select([pl.col(f'dim_{i}_diff').var() for i in range(n_dims)])\
         .to_numpy()[0]
     
 
     component_df = pl.read_parquet(os.path.join(trend_path, f'{cfg.dim_reduction_method}_metadata.parquet.zstd'))
-    stance_cols = [col for col in target_head_df.columns if col not in ['createtime', 'filter_value', 'coord_21d']]
+    stance_cols = [col for col in target_head_df.columns if col not in ['createtime', 'filter_value', coord_col]]
    
     if cfg.dim_reduction_method == 'sfa':
-        components = component_df.filter(pl.col('n_components') == 21)['W'][0].to_numpy()
-    elif cfg.dim_reduction_method == 'pca':
-        components = np.stack(component_df.filter(pl.col('n_dims') == 21)['components'][0].to_numpy())
+        components = component_df.filter(pl.col('n_components') == n_dims)['W'][0].to_numpy()
+    elif cfg.dim_reduction_method in ['pca', 'ppca', 'pica']:
+        components = np.stack(component_df.filter(pl.col('n_dims') == n_dims)['components'][0].to_numpy())
     else:
         raise ValueError(f"Unknown dim_reduction_method: {cfg.dim_reduction_method}")
 

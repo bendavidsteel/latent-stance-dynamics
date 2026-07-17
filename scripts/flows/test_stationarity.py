@@ -29,10 +29,11 @@ This module implements several tests for stationarity of dynamical systems:
    unit root." Journal of Econometrics, 54, 159-178.
 
 5. Ensemble Spread Analysis
-   - Measures divergence of trajectories from ensemble centroid over time
-   - Related to Lyapunov exponent analysis for chaotic systems
-   Reference: Wolf, A. et al. (1985). "Determining Lyapunov exponents from a
-   time series." Physica D, 16, 285-317.
+   - Measures average distance of trajectories from the ensemble centroid
+     over time. Constant spread is consistent with a translating cloud
+     (drift without dispersion); growing spread suggests divergence.
+   - Note: this is *not* a Lyapunov-exponent measurement, which would
+     require tracking the separation of nearby trajectory pairs.
 """
 import os
 
@@ -47,118 +48,217 @@ from tqdm import tqdm
 from nn_potential import INITIAL_DATE, UNIT_DAYS
 
 
-def test_msd(trajectories: list[np.ndarray], max_lag: int = None) -> dict:
-    """Compute Mean Squared Displacement (MSD) to test for diffusive behavior.
+def _compute_msd_curve(trajectories: list[np.ndarray], max_lag: int = None) -> tuple:
+    """Compute time- and ensemble-averaged MSD(τ) over a sampled lag grid.
 
-    The MSD measures the average squared displacement as a function of lag time τ:
-        MSD(τ) = <|r(t+τ) - r(t)|²>
-
-    For different types of motion:
-    - Normal diffusion (random walk): MSD ∝ τ (linear growth)
-    - Stationary/confined: MSD plateaus at large τ
-    - Superdiffusion: MSD ∝ τ^α with α > 1
-    - Subdiffusion: MSD ∝ τ^α with α < 1
-
-    This implementation uses time-averaged MSD for each trajectory, then
-    averages across the ensemble.
-
-    Reference:
-        Einstein, A. (1905). Annalen der Physik, 17, 549-560.
-        Qian, H. et al. (1991). Biophys J, 60(4), 910-921.
-
-    Args:
-        trajectories: List of trajectory arrays, each shape (T, D)
-        max_lag: Maximum lag time to compute (default: min trajectory length // 2)
+    MSD(τ) = <|r(t+τ) - r(t)|²>_{t, ensemble}, summed over spatial dimensions.
 
     Returns:
-        Dictionary with MSD values, linear fit parameters, and stationarity assessment
+        (lags, msd, msd_stderr) — lags is shape (K,), the others same shape.
     """
     min_len = min(len(t) for t in trajectories)
     if max_lag is None:
         max_lag = min_len // 2
 
-    # Sample lag times (use ~20 points for efficiency)
     lags = np.arange(1, max_lag + 1, max(1, max_lag // 20))
     msd_values = []
     msd_stderr = []
 
     for lag in lags:
-        # Time-averaged MSD: average over all time origins t
-        # MSD(τ) = <|r(t+τ) - r(t)|²>_t,ensemble
         squared_displacements = []
-
         for traj in trajectories:
             T = len(traj)
             if T > lag:
-                # Compute displacements for all valid time origins
-                for t0 in range(T - lag):
-                    disp = traj[t0 + lag] - traj[t0]
-                    sq_disp = np.sum(disp ** 2)  # Sum over dimensions
-                    squared_displacements.append(sq_disp)
-
+                disp = traj[lag:] - traj[:T - lag]
+                sq_disp = np.sum(disp ** 2, axis=1)
+                squared_displacements.append(sq_disp)
         if squared_displacements:
-            msd = np.mean(squared_displacements)
-            stderr = np.std(squared_displacements) / np.sqrt(len(squared_displacements))
-            msd_values.append(msd)
-            msd_stderr.append(stderr)
+            all_sq = np.concatenate(squared_displacements)
+            msd_values.append(np.mean(all_sq))
+            msd_stderr.append(np.std(all_sq) / np.sqrt(len(all_sq)))
         else:
             msd_values.append(np.nan)
             msd_stderr.append(np.nan)
 
     msd_values = np.array(msd_values)
     msd_stderr = np.array(msd_stderr)
-    valid_mask = ~np.isnan(msd_values)
-    lags_valid = lags[valid_mask]
-    msd_valid = msd_values[valid_mask]
+    valid = ~np.isnan(msd_values)
+    return lags[valid], msd_values[valid], msd_stderr[valid]
 
-    # Fit linear regression: MSD = D * lag + b
-    # For random walk: D > 0 (diffusion coefficient), R² high
-    # For stationary: D ≈ 0 or MSD plateaus
-    slope, intercept, r_value, p_value, std_err = stats.linregress(lags_valid, msd_valid)
 
-    # Also fit power law: MSD ∝ τ^α to get anomalous exponent
-    # log(MSD) = α * log(τ) + const
+def test_msd(trajectories: list[np.ndarray], max_lag: int = None, label: str = "") -> dict:
+    """Compute Mean Squared Displacement (MSD) and characterize the dynamics.
+
+    MSD(τ) = <|r(t+τ) - r(t)|²> describes how far trajectories travel from
+    their start as a function of lag τ. For d-dimensional motion:
+
+    - Pure diffusion:        MSD = 2dDτ                    (linear)
+    - Pure ballistic drift:  MSD = (vτ)²                    (quadratic)
+    - Drift + diffusion:     MSD = 2dDτ + (vτ)²             (mixed)
+    - Confined / OU:         MSD saturates at long τ        (plateau)
+    - Anomalous:             MSD ∝ τ^α with α ≠ 1           (sub/super)
+
+    IMPORTANT: MSD shape alone does NOT determine stationarity.
+    An Ornstein–Uhlenbeck process is stationary but exhibits MSD ∝ τ at
+    short lags before saturating. A pure random walk is non-stationary
+    and has MSD ∝ τ at all lags. The shape characterizes the *dynamics*;
+    stationarity is decided by ADF/KPSS and by whether MSD saturates.
+
+    This function reports:
+      1. A power-law fit MSD ∝ τ^α (α as a free parameter).
+      2. A drift+diffusion fit MSD = 2dDτ + (vτ)², separating the diffusion
+         coefficient D from a global drift speed |v|.
+      3. A simple saturation check (does the long-lag MSD plateau?).
+
+    Reference:
+        Einstein, A. (1905). Annalen der Physik, 17, 549-560.
+        Qian, H. et al. (1991). Biophys J, 60(4), 910-921.
+
+    Args:
+        trajectories: List of trajectory arrays, each shape (T, D).
+        max_lag: Maximum lag time (default: min trajectory length // 2).
+        label: Optional label for the printed header (e.g. "drift-removed").
+
+    Returns:
+        Dictionary with MSD curve, fit parameters, and a regime label.
+        is_stationary is intentionally None — see ADF/KPSS for that verdict.
+    """
+    lags_valid, msd_valid, msd_stderr_valid = _compute_msd_curve(trajectories, max_lag)
+    n_dim = trajectories[0].shape[1]
+
+    # Linear fit: MSD = slope * τ + intercept
+    slope, intercept, r_value, p_value, _ = stats.linregress(lags_valid, msd_valid)
+
+    # Power law fit: log MSD = α log τ + const
     log_lags = np.log(lags_valid)
     log_msd = np.log(msd_valid + 1e-10)
-    alpha, log_const, r_alpha, p_alpha, _ = stats.linregress(log_lags, log_msd)
+    alpha, log_const, r_alpha, _, _ = stats.linregress(log_lags, log_msd)
 
-    print("\n=== Mean Squared Displacement (MSD) Analysis ===")
-    print(f"MSD at lag 1: {msd_valid[0]:.4f}")
-    print(f"MSD at lag {lags_valid[-1]}: {msd_valid[-1]:.4f}")
-    print(f"Linear fit: MSD = {slope:.6f} * τ + {intercept:.4f}")
-    print(f"  R² = {r_value**2:.4f}, p-value = {p_value:.2e}")
-    print(f"Power law fit: MSD ∝ τ^{alpha:.2f}")
-    print(f"  R² = {r_alpha**2:.4f}")
+    # Drift+diffusion fit: MSD = a*τ + b*τ²  with a = 2dD, b = |v|²
+    # Solve via non-negative-constrained least squares so D and |v|² stay ≥ 0.
+    design = np.column_stack([lags_valid, lags_valid ** 2])
+    coeffs, *_ = np.linalg.lstsq(design, msd_valid, rcond=None)
+    a_fit, b_fit = coeffs
+    D_fit = max(a_fit, 0.0) / (2 * n_dim)
+    v_fit = np.sqrt(max(b_fit, 0.0))
+    msd_pred = design @ coeffs
+    ss_res = np.sum((msd_valid - msd_pred) ** 2)
+    ss_tot = np.sum((msd_valid - msd_valid.mean()) ** 2)
+    r2_drift_diff = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
-    # Interpretation based on anomalous exponent α
-    if alpha > 0.9 and r_alpha**2 > 0.9:
-        if alpha < 1.1:
-            print("Result: MSD ∝ τ (α ≈ 1) -> Normal diffusion / random walk -> NON-STATIONARY")
-        else:
-            print(f"Result: MSD ∝ τ^{alpha:.1f} (α > 1) -> Superdiffusion -> NON-STATIONARY")
-        is_stationary = False
-    elif alpha < 0.5 and r_alpha**2 > 0.8:
-        print(f"Result: MSD ∝ τ^{alpha:.1f} (α < 0.5) -> Subdiffusion/confined -> Likely STATIONARY")
-        is_stationary = True
-    elif slope > 0 and p_value < 0.05:
-        print("Result: MSD grows with lag time -> NON-STATIONARY")
-        is_stationary = False
+    # Saturation check: compare MSD over the last third of lags to a flat line.
+    n_tail = max(3, len(lags_valid) // 3)
+    tail_lags = lags_valid[-n_tail:]
+    tail_msd = msd_valid[-n_tail:]
+    tail_slope, _, tail_r, tail_p, _ = stats.linregress(tail_lags, tail_msd)
+    # Normalize tail slope by the mean tail MSD per unit lag — small => plateau.
+    tail_growth_rate = tail_slope * (tail_lags[-1] - tail_lags[0]) / (np.mean(tail_msd) + 1e-10)
+    saturates = abs(tail_growth_rate) < 0.1 and tail_p > 0.05
+
+    header = f"=== Mean Squared Displacement (MSD) Analysis{f' [{label}]' if label else ''} ==="
+    print(f"\n{header}")
+    print(f"MSD at lag {lags_valid[0]}: {msd_valid[0]:.4f} (PC²)")
+    print(f"MSD at lag {lags_valid[-1]}: {msd_valid[-1]:.4f} (PC²)")
+    print(f"Linear fit:           MSD = {slope:.6f} τ + {intercept:.4f}   R² = {r_value**2:.4f}")
+    print(f"Power law fit:        MSD ∝ τ^{alpha:.3f}                       R² = {r_alpha**2:.4f}")
+    print(f"Drift+diffusion fit:  MSD = 2·{n_dim}·D·τ + (v·τ)²")
+    print(f"                      D = {D_fit:.6f} PC²/lag,  |v| = {v_fit:.6f} PC/lag   R² = {r2_drift_diff:.4f}")
+    print(f"Tail (last {n_tail} lags) growth rate over tail span: {tail_growth_rate:+.3f} "
+          f"(p = {tail_p:.2e}) -> {'saturates' if saturates else 'still growing'}")
+
+    # Characterize the dynamical regime (NOT stationarity).
+    if saturates:
+        regime = 'confined_or_OU'
+        print("Regime: MSD saturates -> confined dynamics (e.g. Ornstein–Uhlenbeck).")
+    elif alpha > 1.5 and r_alpha**2 > 0.9:
+        regime = 'ballistic_or_drift_dominated'
+        print(f"Regime: α ≈ {alpha:.2f} -> drift-dominated (super-diffusive).")
+    elif alpha > 1.1 and r_alpha**2 > 0.9:
+        regime = 'drift_plus_diffusion'
+        print(f"Regime: α ≈ {alpha:.2f} -> drift + diffusion mix.")
+    elif 0.9 <= alpha <= 1.1 and r_alpha**2 > 0.9:
+        regime = 'diffusive'
+        print(f"Regime: α ≈ {alpha:.2f} -> diffusive scaling. NOTE: this alone does not "
+              "distinguish a random walk from an OU process at short lags.")
+    elif alpha < 0.9 and r_alpha**2 > 0.8:
+        regime = 'subdiffusive'
+        print(f"Regime: α ≈ {alpha:.2f} -> sub-diffusive (confined / trapped).")
     else:
-        print("Result: MSD does not grow significantly -> Consistent with STATIONARITY")
-        is_stationary = True
+        regime = 'unclassified'
+        print("Regime: power-law fit poor; see drift+diffusion fit and saturation check.")
 
     return {
         'lags': lags_valid,
         'msd': msd_valid,
-        'msd_stderr': msd_stderr[valid_mask],
+        'msd_stderr': msd_stderr_valid,
         'slope': slope,
         'intercept': intercept,
-        'r_squared': r_value**2,
+        'r_squared': r_value ** 2,
         'p_value': p_value,
         'alpha': alpha,
-        'alpha_r_squared': r_alpha**2,
-        'is_stationary': is_stationary
+        'alpha_r_squared': r_alpha ** 2,
+        'D': D_fit,
+        'v': v_fit,
+        'drift_diff_r_squared': r2_drift_diff,
+        'tail_growth_rate': tail_growth_rate,
+        'saturates': saturates,
+        'regime': regime,
+        'is_stationary': None,  # MSD shape alone does not determine this.
     }
+
+
+def compute_drift_removed_trajectories(
+    df: pl.DataFrame,
+    coord_cols: list[str],
+    n_centroid_bins: int = 50,
+    min_length: int = 100,
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
+    """Subtract the time-varying ensemble centroid from each trajectory.
+
+    Bins time into ``n_centroid_bins`` equal-width windows, computes the
+    ensemble mean of each coord column inside each bin, then subtracts the
+    bin's centroid from every observation falling in that bin. The result is
+    a set of residual trajectories r_i(t) = x_i(t) - c(t).
+
+    If the picture is "moving school of fish", residual MSD should saturate
+    even when raw MSD grows linearly.
+
+    Returns:
+        (residual_trajectories, centroid_bin_centers, centroid_values)
+        where centroid_values has shape (n_centroid_bins, len(coord_cols)).
+    """
+    df = df.sort('createtime')
+    min_time = df['createtime'].min()
+    max_time = df['createtime'].max()
+    time_range_seconds = (max_time - min_time).total_seconds()
+    bin_seconds = max(1, time_range_seconds / n_centroid_bins)
+
+    df_with_bin = df.with_columns(
+        ((pl.col('createtime') - min_time).dt.total_seconds() / bin_seconds)
+        .floor()
+        .clip(0, n_centroid_bins - 1)
+        .cast(pl.Int64)
+        .alias('_bin_idx')
+    )
+
+    centroid_df = df_with_bin.group_by('_bin_idx').agg(
+        [pl.col(c).mean().alias(f'{c}_centroid') for c in coord_cols]
+    ).sort('_bin_idx')
+
+    df_residual = df_with_bin.join(centroid_df, on='_bin_idx', how='left').with_columns(
+        [(pl.col(c) - pl.col(f'{c}_centroid')).alias(c) for c in coord_cols]
+    )
+
+    # Partition by filter_value to recover per-user residual trajectories.
+    residual_trajectories = [
+        f.sort('createtime').select(coord_cols).to_numpy()
+        for f in df_residual.partition_by('filter_value')
+        if f.height > min_length
+    ]
+
+    centroid_bin_centers = centroid_df['_bin_idx'].to_numpy()
+    centroid_values = centroid_df.select([f'{c}_centroid' for c in coord_cols]).to_numpy()
+    return residual_trajectories, centroid_bin_centers, centroid_values
 
 
 def test_rolling_statistics(df: pl.DataFrame, coord_cols: list[str], n_windows: int = 5) -> dict:
@@ -182,65 +282,126 @@ def test_rolling_statistics(df: pl.DataFrame, coord_cols: list[str], n_windows: 
     Returns:
         Dictionary with window statistics and stationarity assessment
     """
-    # Compute window duration from time range
+    # Bin every observation by integer window index (deterministic alignment).
     min_time = df['createtime'].min()
     max_time = df['createtime'].max()
     time_range_seconds = (max_time - min_time).total_seconds()
-    window_seconds = int(time_range_seconds / n_windows)
-    window_duration = f"{window_seconds}s"
+    window_seconds = time_range_seconds / n_windows
 
-    # Use group_by_dynamic for time-based windowing
-    window_stats = df.sort('createtime').group_by_dynamic(
-        'createtime',
-        every=window_duration
-    ).agg(
-        [pl.col(c).mean().alias(f'{c}_mean') for c in coord_cols] +
-        [pl.col(c).var().alias(f'{c}_var') for c in coord_cols]
+    df_w = df.sort('createtime').with_columns(
+        ((pl.col('createtime') - min_time).dt.total_seconds() / window_seconds)
+        .floor()
+        .clip(0, n_windows - 1)
+        .cast(pl.Int64)
+        .alias('_win')
     )
+
+    window_stats = df_w.group_by('_win').agg(
+        [pl.col(c).mean().alias(f'{c}_mean') for c in coord_cols] +
+        [pl.col(c).var().alias(f'{c}_var') for c in coord_cols] +
+        [pl.len().alias('_n')]
+    ).sort('_win')
 
     window_means = window_stats.select([f'{c}_mean' for c in coord_cols]).to_numpy()
     window_vars = window_stats.select([f'{c}_var' for c in coord_cols]).to_numpy()
+    window_n = window_stats['_n'].to_numpy()
 
-    # Test if means differ across windows (ANOVA-like)
-    mean_variation = np.std(window_means, axis=0)
-    var_variation = np.std(window_vars, axis=0)
-
-    # Compare first and last window
+    initial_mean = window_means[0]
+    initial_var = window_vars[0]
+    final_var = window_vars[-1]
     mean_drift = window_means[-1] - window_means[0]
     var_change = window_vars[-1] - window_vars[0]
 
+    # Cohen's d per dim: drift in pooled-std units (drift relative to spread).
+    pooled_std = np.sqrt((initial_var + final_var) / 2 + 1e-10)
+    cohens_d = mean_drift / pooled_std
+
+    # Variance change relative to initial variance (per dim).
+    var_change_rel = var_change / (initial_var + 1e-10)
+
+    # ANOVA across windows per dim: are window means significantly different?
+    # F-test for variance equality across windows (Levene's test, more robust
+    # than Bartlett to non-normality).
+    n_dims = len(coord_cols)
+    anova_p = np.full(n_dims, np.nan)
+    anova_f = np.full(n_dims, np.nan)
+    levene_p = np.full(n_dims, np.nan)
+    for d, c in enumerate(coord_cols):
+        samples = [
+            df_w.filter(pl.col('_win') == w)[c].to_numpy()
+            for w in range(n_windows)
+        ]
+        samples = [s for s in samples if len(s) > 1]
+        if len(samples) >= 2:
+            anova_f[d], anova_p[d] = stats.f_oneway(*samples)
+            try:
+                _, levene_p[d] = stats.levene(*samples)
+            except ValueError:
+                pass
+
     print("\n=== Rolling Statistics Analysis ===")
-    print(f"Window duration: {window_seconds / 86400:.1f} days, {len(window_stats)} windows")
-    print(f"Mean drift (last - first window): {np.mean(np.abs(mean_drift)):.4f} (avg across dims)")
-    print(f"Variance change (last - first window): {np.mean(var_change):.4f} (avg across dims)")
-    print(f"Std of window means: {np.mean(mean_variation):.4f} (avg across dims)")
-    print(f"Std of window variances: {np.mean(var_variation):.4f} (avg across dims)")
+    print(f"Window duration: {window_seconds / 86400:.1f} days, "
+          f"{len(window_stats)} windows, n per window: "
+          f"{window_n.min()}–{window_n.max()}")
+    cohens_label = "Cohen's d"
+    print("Per-dimension drift (PC units; drift = last − first window):")
+    print(f"  {'dim':>3} | {'init μ':>9} | {'Δμ':>9} | {'init σ²':>9} | {'Δσ²':>9} | "
+          f"{'Δσ²/σ²₀':>9} | {cohens_label:>10} | {'ANOVA p':>10} | {'Levene p':>10}")
+    for d in range(n_dims):
+        print(f"  {d:>3} | {initial_mean[d]:>+9.4f} | {mean_drift[d]:>+9.4f} | "
+              f"{initial_var[d]:>9.4f} | {var_change[d]:>+9.4f} | "
+              f"{var_change_rel[d]:>+9.2%} | "
+              f"{cohens_d[d]:>+10.3f} | {anova_p[d]:>10.2e} | {levene_p[d]:>10.2e}")
 
-    # Relative changes
-    rel_mean_drift = np.mean(np.abs(mean_drift)) / (np.mean(np.abs(window_means[0])) + 1e-10)
-    rel_var_change = np.mean(var_change) / (np.mean(window_vars[0]) + 1e-10)
+    # Across-dim summaries.
+    avg_abs_d = float(np.mean(np.abs(cohens_d)))
+    max_abs_d = float(np.max(np.abs(cohens_d)))
+    avg_var_change_rel = float(np.mean(var_change_rel))
+    n_sig_mean = int(np.sum((anova_p < 0.05) & (np.abs(cohens_d) > 0.2)))
+    n_sig_var = int(np.sum(levene_p < 0.05))
 
-    print(f"Relative mean drift: {rel_mean_drift:.2%}")
-    print(f"Relative variance change: {rel_var_change:.2%}")
+    print(f"\nMean drift summary:  avg |d| = {avg_abs_d:.3f}, max |d| = {max_abs_d:.3f}")
+    print(f"  Cohen's d guidelines: 0.2 = small, 0.5 = medium, 0.8 = large effect")
+    print(f"  Dims with significant ANOVA (p<0.05) AND |d|>0.2: {n_sig_mean}/{n_dims}")
+    print(f"Variance change summary: avg Δσ²/σ²₀ = {avg_var_change_rel:+.2%}")
+    print(f"  Dims with significant Levene test (p<0.05): {n_sig_var}/{n_dims}")
 
-    if rel_var_change > 0.5:
-        print("Result: Variance increases substantially over time -> NON-STATIONARY")
+    # Decision: require both statistical significance AND non-trivial effect.
+    # Variance: any dim with significant Levene + |Δσ²/σ²₀| > 0.5 → non-stationary.
+    # Mean: any dim with significant ANOVA + |d| > 0.2 (small effect) → non-stationary.
+    var_nonstat = bool(np.any((levene_p < 0.05) & (np.abs(var_change_rel) > 0.5)))
+    mean_nonstat = n_sig_mean > 0
+
+    if var_nonstat and mean_nonstat:
+        print("Result: Both mean and variance drift significantly -> NON-STATIONARY (mean and variance)")
         is_stationary = False
-    elif rel_mean_drift > 0.5:
-        print("Result: Mean drifts substantially over time -> NON-STATIONARY")
+    elif var_nonstat:
+        print("Result: Variance changes significantly -> NON-STATIONARY (in variance)")
+        is_stationary = False
+    elif mean_nonstat:
+        print(f"Result: Mean drifts significantly in {n_sig_mean}/{n_dims} dim(s) "
+              f"(avg |d| = {avg_abs_d:.2f}) -> NON-STATIONARY (in mean)")
         is_stationary = False
     else:
-        print("Result: Statistics relatively stable -> Consistent with STATIONARITY")
+        print("Result: No significant drift in mean or variance -> Consistent with STATIONARITY")
         is_stationary = True
 
     return {
         'window_means': window_means,
         'window_vars': window_vars,
+        'window_n': window_n,
+        'initial_mean': initial_mean,
+        'initial_var': initial_var,
         'mean_drift': mean_drift,
         'var_change': var_change,
-        'rel_mean_drift': rel_mean_drift,
-        'rel_var_change': rel_var_change,
-        'is_stationary': is_stationary
+        'var_change_rel': var_change_rel,
+        'cohens_d': cohens_d,
+        'anova_f': anova_f,
+        'anova_p': anova_p,
+        'levene_p': levene_p,
+        'n_sig_mean_dims': n_sig_mean,
+        'n_sig_var_dims': n_sig_var,
+        'is_stationary': is_stationary,
     }
 
 
@@ -362,19 +523,30 @@ def test_adf_kpss(trajectories: list[np.ndarray], n_sample: int = 100) -> dict:
     print(f"  Dimensions rejecting: {sum(kpss_rejects_by_dim)}/{n_test_dims}")
     print(f"  Majority rejects: {kpss_majority_rejects} (reject -> evidence for non-stationarity)")
 
-    # Interpretation based on majority of dimensions
+    # Interpretation based on majority of dimensions.
+    # Four-way table (ADF H0: unit root; KPSS H0: stationary):
+    #   ADF rejects, KPSS doesn't  -> stationary
+    #   ADF doesn't, KPSS rejects  -> unit root / random-walk non-stationary
+    #   neither rejects            -> inconclusive (low test power)
+    #   both reject                -> trend-stationary or structural breaks
+    #                                 (structured non-stationarity, NOT random walk)
     if adf_majority_rejects and not kpss_majority_rejects:
         print("\nResult: ADF rejects unit root, KPSS doesn't reject stationarity -> STATIONARY")
         is_stationary = True
+        regime = 'stationary'
     elif not adf_majority_rejects and kpss_majority_rejects:
-        print("\nResult: ADF doesn't reject unit root, KPSS rejects stationarity -> NON-STATIONARY")
+        print("\nResult: ADF doesn't reject unit root, KPSS rejects stationarity -> NON-STATIONARY (unit root / random walk)")
         is_stationary = False
+        regime = 'unit_root'
     elif not adf_majority_rejects and not kpss_majority_rejects:
-        print("\nResult: Both tests inconclusive -> Possibly TREND-STATIONARY")
+        print("\nResult: Neither test rejects -> INCONCLUSIVE (low test power)")
         is_stationary = None
+        regime = 'inconclusive'
     else:
-        print("\nResult: Conflicting results -> INCONCLUSIVE")
-        is_stationary = None
+        print("\nResult: Both tests reject -> TREND-STATIONARY or STRUCTURAL BREAKS")
+        print("        (structured non-stationarity around a deterministic component, NOT random walk)")
+        is_stationary = False
+        regime = 'trend_stationary_or_breaks'
 
     return {
         'adf_combined_by_dim': adf_combined_by_dim,
@@ -386,24 +558,19 @@ def test_adf_kpss(trajectories: list[np.ndarray], n_sample: int = 100) -> dict:
 
 
 def test_ensemble_spread(df: pl.DataFrame, coord_cols: list[str], n_windows: int = 20) -> dict:
-    """Test if ensemble of trajectories spreads out (fans out) over time.
+    """Test if the ensemble of trajectories spreads out over time.
 
     Computes the average distance of trajectories from the ensemble centroid
-    at each time point. If this increases, trajectories are diverging, which
-    indicates non-stationary dynamics.
+    at each time point. Constant spread with a moving centroid is consistent
+    with rigid translation of the cloud (correlated drift without dispersion);
+    growing spread indicates dispersion / divergence.
 
-    This is related to Lyapunov exponent analysis: positive Lyapunov exponents
-    indicate exponential divergence of nearby trajectories (chaos), while for
-    stationary systems the spread should remain bounded.
-
-    Note: This measures ensemble spread, not individual trajectory divergence.
-    Trajectories can drift together (correlated motion) without increasing
-    spread from the centroid.
-
-    Reference:
-        Wolf, A., Swift, J.B., Swinney, H.L., Vastano, J.A. (1985).
-        "Determining Lyapunov exponents from a time series."
-        Physica D, 16(3), 285-317.
+    Note: This measures ensemble dispersion, not individual trajectory
+    divergence. It is NOT a Lyapunov-exponent estimate — that would require
+    tracking the separation of initially-nearby trajectory pairs over time.
+    Two trajectories can have a positive Lyapunov exponent (locally diverging)
+    while the ensemble spread stays constant if the divergence is bounded by
+    a confining potential.
 
     Args:
         df: Polars DataFrame with 'createtime', 'filter_value', and coordinate columns
@@ -504,21 +671,19 @@ def test_ensemble_spread(df: pl.DataFrame, coord_cols: list[str], n_windows: int
 def main(cfg):
     print("Loading data...")
 
-    n_pca_dims = 21
-
-    target_path = os.path.join(cfg.trend_path, 'pca_coords.parquet.zstd')
-    target_df = pl.read_parquet(target_path, columns=['createtime', 'filter_value', f'coord_{n_pca_dims}d'])
+    target_path = os.path.join(cfg.trend_path, 'ppca_coords.parquet.zstd')
+    target_df = pl.read_parquet(target_path)
+    coord_col = [c for c in target_df.columns if c.startswith('coord_')][0]
+    n_pca_dims = int(coord_col.split('_')[1][:-1])
 
     target_df = target_df.filter(pl.col('filter_value') != '')
-    target_df = target_df.select(['createtime', 'filter_value', f'coord_{n_pca_dims}d']) \
+    target_df = target_df.select(['createtime', 'filter_value', coord_col]) \
         .sort(['filter_value', 'createtime']) \
         .with_columns(((pl.col('createtime') - INITIAL_DATE).dt.total_days() / UNIT_DAYS).alias('t0')) \
-        .rename({f'coord_{n_pca_dims}d': 'x0'})
+        .rename({coord_col: 'x0'})
 
     target_df = target_df \
-        .with_columns([pl.col('x0').arr.get(i).alias(f'x0_{i}') for i in range(n_pca_dims)]) \
-        # .with_columns([pl.col(f'x0_{i}').rolling_mean(cfg.rolling_mean_window).over('filter_value') for i in range(n_pca_dims)]) \
-        # .drop_nulls([f'x0_{i}' for i in range(n_pca_dims)])
+        .with_columns([pl.col('x0').arr.get(i).alias(f'x0_{i}') for i in range(n_pca_dims)])
 
     # Partition into separate trajectories by filter_value
     filter_dfs = target_df.partition_by('filter_value')
@@ -538,8 +703,8 @@ def main(cfg):
 
     coord_cols = [f'x0_{i}' for i in range(n_pca_dims)]
 
-    # Test 1: Mean Squared Displacement (MSD)
-    results['msd'] = test_msd(trajectories)
+    # Test 1: Mean Squared Displacement (MSD) on raw trajectories
+    results['msd'] = test_msd(trajectories, label="raw")
 
     # Test 2: Rolling statistics (uses calendar time alignment)
     results['rolling_stats'] = test_rolling_statistics(target_df, coord_cols)
@@ -550,6 +715,35 @@ def main(cfg):
     # Test 4: Ensemble spread (uses calendar time alignment)
     results['ensemble_spread'] = test_ensemble_spread(target_df, coord_cols)
 
+    # Test 5: MSD on drift-removed (centroid-subtracted) trajectories.
+    # If raw MSD grows linearly but residual MSD saturates, the dynamics are
+    # "deterministic drift + bounded diffusion" rather than a random walk.
+    print("\n--- Computing centroid-removed trajectories ---")
+    residual_trajectories, _, _ = compute_drift_removed_trajectories(
+        target_df, coord_cols, n_centroid_bins=50, min_length=min_length
+    )
+    print(f"{len(residual_trajectories)} residual trajectories after centroid removal.")
+    results['msd_drift_removed'] = test_msd(residual_trajectories, label="drift-removed")
+
+    # Reconciliation: compare raw vs residual MSD growth.
+    raw_saturates = results['msd']['saturates']
+    res_saturates = results['msd_drift_removed']['saturates']
+    raw_alpha = results['msd']['alpha']
+    res_alpha = results['msd_drift_removed']['alpha']
+    raw_v = results['msd']['v']
+    res_v = results['msd_drift_removed']['v']
+
+    print("\n=== Raw vs drift-removed MSD reconciliation ===")
+    print(f"  raw:           α = {raw_alpha:.2f}, |v| = {raw_v:.4f}, saturates = {raw_saturates}")
+    print(f"  drift-removed: α = {res_alpha:.2f}, |v| = {res_v:.4f}, saturates = {res_saturates}")
+    if not raw_saturates and res_saturates:
+        print("  -> Raw MSD grows but residual MSD saturates: dynamics are")
+        print("     deterministic drift + bounded diffusion (cloud translates rigidly).")
+    elif raw_saturates and res_saturates:
+        print("  -> Both saturate: bounded dynamics with no global drift.")
+    elif not raw_saturates and not res_saturates:
+        print("  -> Neither saturates: dispersion grows even after removing global drift.")
+
     # Summary
     print("\n" + "="*50)
     print("SUMMARY")
@@ -558,7 +752,7 @@ def main(cfg):
     stationarity_votes = []
     for test_name, test_result in results.items():
         is_stat = test_result.get('is_stationary')
-        status = "STATIONARY" if is_stat else ("NON-STATIONARY" if is_stat is False else "INCONCLUSIVE")
+        status = "STATIONARY" if is_stat else ("NON-STATIONARY" if is_stat is False else "INCONCLUSIVE / N/A")
         print(f"  {test_name}: {status}")
         if is_stat is not None:
             stationarity_votes.append(is_stat)

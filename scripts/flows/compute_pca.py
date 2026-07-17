@@ -20,6 +20,7 @@ def main(cfg):
     pca, coords, components, explained_variance_ratio = do_pca(target_df, stance_cols, n_components=n_dims)
     assert len(stance_cols) == components.shape[1]
     target_df = target_df.with_columns(pl.Series(name=f'coord_{n_dims}d', values=coords))
+    target_df = target_df.select(['createtime', 'filter_value', f'coord_{n_dims}d'])
     pca_metadata.append({
         'n_dims': n_dims,
         'explained_variance_ratio': explained_variance_ratio,

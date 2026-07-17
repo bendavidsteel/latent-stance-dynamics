@@ -99,8 +99,8 @@ def plot_fig(
         added_labels.add(color_val)
 
         ax.plot(
-            user_target_df['coord'].arr.get(0).rolling_mean(window_size),
-            user_target_df['coord'].arr.get(1).rolling_mean(window_size),
+            user_target_df['coord'].arr.get(0).rolling_mean(window_size, min_samples=1),
+            user_target_df['coord'].arr.get(1).rolling_mean(window_size, min_samples=1),
             alpha=0.3,
             color=color_map[color_val],
             label=label
@@ -164,8 +164,8 @@ def plot_platform_fig(
             added_labels.add(platform)
 
             ax.plot(
-                user_target_df['coord'].arr.get(0).rolling_mean(window_size),
-                user_target_df['coord'].arr.get(1).rolling_mean(window_size),
+                user_target_df['coord'].arr.get(0).rolling_mean(window_size, min_samples=1),
+                user_target_df['coord'].arr.get(1).rolling_mean(window_size, min_samples=1),
                 alpha=0.3,
                 color=color_map[platform],
                 label=label
