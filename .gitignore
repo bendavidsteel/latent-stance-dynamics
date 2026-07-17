@@ -1,3 +1,13 @@
+tmp
+wandb
+multirun
+model_checkpoints
+mlruns
+local_cache
+config
+out
+outputs
+*.pickle
 .vscode/
 data/
 figs/
