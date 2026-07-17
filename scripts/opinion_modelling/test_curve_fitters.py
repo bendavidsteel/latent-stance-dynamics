@@ -50,10 +50,10 @@ def plot_gp(
             max_x = torch.max(train_x)
             start_x = min_x - 0.1 * (max_x - min_x)
             end_x = max_x + 0.1 * (max_x - min_x)
-            test_x = torch.linspace(start_x, end_x, n_test).to('cuda')
+            test_x = torch.linspace(start_x, end_x, n_test)#.to('cuda')
             test_classifier_ids = torch.zeros(n_test, dtype=torch.long)
-            model = model.cuda()
-            model_pred = model.predict(test_x)
+            # model = model.cuda()
+            model_pred = model(test_x)
             # likelihood.set_classifier_ids(test_classifier_ids)
             
             # Get upper and lower confidence bounds
@@ -68,6 +68,7 @@ def plot_gp(
         if plot_likelihood:
             ax_likelihood.plot(train_x.numpy(), train_y.numpy(), 'k*')
             model_pred = model(test_x)
+            likelihood.classifier_ids = likelihood.classifier_ids[:test_x.shape[0]]
             observed_pred = likelihood(model_pred) # returns samples that are run through the likelihood
             # average over samples
             ax_likelihood.matshow(observed_pred.probs.mean(0).cpu().numpy().T, aspect='auto', extent=(train_x.numpy().min(), train_x.numpy().max(), -1.5, 1.5), origin='lower')
@@ -108,10 +109,10 @@ def plot_spline(
     ax.legend(['Observed Data', 'Mean', 'Confidence'])
 
 def main():
-    num_data_points = 10
+    num_data_points = 100
     user_stance = np.linspace(-1, 1, num_data_points)
     user_stance_variance = 0.1
-    predict_profile = 'low_recall'
+    predict_profile = 'med_precision'
     dataset = datasets.SimpleGenerativeOpinionTimelineDataset(user_stance, user_stance_variance, num_data_points, pred_profile_type=predict_profile, halflife=10.)
 
     X_norm, X, y, classifier_ids = prep_gp_data(dataset)
@@ -123,16 +124,6 @@ def main():
 
     model_type = 'gp'
     if model_type == 'gp':
-
-        # get some samples from the untrained models
-        # fig, ax = plt.subplots(1, 1, figsize=(4, 3))
-        # for idx in range(min(3, len(model_list.models))):
-        #     i, k = model_map[idx]
-        #     model = model_list.models[idx]
-        #     likelihood = likelihood_list.likelihoods[idx]
-        #     plot(model, likelihood, train_x=X_norm[i,:], train_y=y[i,:,k], plot_observed_data=True, plot_predictions=True, ax=ax)
-        # plt.show()
-        
         model_list, likelihood_list, model_map, losses = train_gaussian_process(
             X_norm, 
             y, 
@@ -160,8 +151,8 @@ def main():
             # model = model_list[idx]
             timeline, mean, confidence_interval = timelines[i], means[i,:,k], confidence_intervals[i,:,k]
             plot_spline(timeline, mean, confidence_interval, train_x=X[i,:], train_y=y[i,:,k], plot_observed_data=True, plot_predictions=True, ax=ax)
-    plt.show()
-
+    # plt.show()
+    plt.savefig('gp.png')
     # timestamps, means = get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y)
 
 
