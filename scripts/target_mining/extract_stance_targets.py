@@ -131,7 +131,8 @@ class PlatformHandler:
                 pl.col('inReplyToTweetId').replace("None", None).replace("-1", None).cast(pl.UInt64),
             ])
             df = df.join(self.twitter_df.select(['id', pl.col('rawContent').alias('inReplyToTweet')]), left_on='inReplyToTweetId', right_on='id', how='left')
-            if 'rawContent' in df.schema['quotedTweet']:
+            quoted_dtype = df.schema['quotedTweet']
+            if isinstance(quoted_dtype, pl.Struct) and 'rawContent' in quoted_dtype.to_schema():
                 df = df.with_columns(
                     pl.when(pl.col('inReplyToTweet').is_not_null())\
                         .then(pl.col('inReplyToTweet'))\
