@@ -420,17 +420,15 @@ def main(cfg):
     from plnn.models import DeepTimePhiPLNN
 
     from nn_potential import df_to_data, compute_rolling_means, build_horizon_pairs, \
-        evaluate_dataloader, compute_training_split, apply_split
+        evaluate_dataloader, compute_training_split, apply_split, run_dir
     from plot_nn_potential import get_most_recent_state
 
     n_dims = cfg.n_dims
     dims = list(range(n_dims))
     trend_name = os.path.basename(cfg.trend_path.rstrip('/'))
 
-    if cfg.platform != 'all':
-        dir_path = f'./out/{trend_name}/dims_{"_".join([str(d) for d in dims])}_{cfg.platform}'
-    else:
-        dir_path = f'./out/{trend_name}/dims_{"_".join([str(d) for d in dims])}'
+    # same layout the trainer writes, including the latent and split tags
+    dir_path = run_dir(cfg)
     if cfg.rolling_mean_window != 100:
         dir_path = f"{dir_path}_rm{cfg.rolling_mean_window}"
 

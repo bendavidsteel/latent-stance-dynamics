@@ -19,6 +19,7 @@ from plnn.models import DeepTimePhiPLNN
 
 from nn_potential import \
     apply_split, \
+    run_dir, \
     build_horizon_pairs, \
     compute_rolling_means, \
     compute_training_split, \
@@ -87,10 +88,8 @@ def model_dir_for_cfg(cfg):
     n_dims = cfg.n_dims
     dims = list(range(n_dims))
     trend_name = os.path.basename(cfg.trend_path.rstrip('/'))
-    if cfg.platform != 'all':
-        dir_path = f'./out/{trend_name}/dims_{"_".join(str(d) for d in dims)}_{cfg.platform}'
-    else:
-        dir_path = f'./out/{trend_name}/dims_{"_".join(str(d) for d in dims)}'
+    # same layout the trainer writes, including the latent and split tags
+    dir_path = run_dir(cfg)
     if cfg.rolling_mean_window != 100:
         dir_path = f"{dir_path}_rm{cfg.rolling_mean_window}"
     return dir_path

@@ -12,6 +12,10 @@ import polars as pl
 import wandb
 from tqdm import tqdm
 
+import splits
+from latent_gp import LatentConfig, build_latents, coord_cols
+from latent_gp import cells as gp_cells
+
 from plnn.dataset import LandscapeSimulationDataset, NumpyLoader
 from plnn.models import DeepTimePhiPLNN
 from plnn.loss_functions import select_loss_function
@@ -23,8 +27,28 @@ logger = logging.getLogger(__name__)
 INITIAL_DATE = datetime.datetime(2020, 1, 1)
 UNIT_DAYS = 365.25
 
+# The factor model needs float64 and turns on JAX's x64 when latent_gp is
+# imported. That is global, so the landscape side has to say float32 explicitly
+# or its solver silently runs in double precision.
+LANDSCAPE_DTYPE = np.float32
+
+
 def df_to_data(df):
-    return [[{'t0': d['t0'], 'x0': np.array(d['x0'])[np.newaxis,:], 't1': d['t1'], 'x1': np.array(d['x1'])[np.newaxis,:]} for d in p.to_dicts()] for p in df.partition_by('filter_value')]
+    """Per-trajectory lists of timestep dicts, as LandscapeSimulationDataset wants.
+
+    Columns are pulled out once per trajectory rather than row by row; at a few
+    hundred thousand pairs the per-row dict conversion dominates evaluation.
+    """
+    out = []
+    for p in df.partition_by('filter_value'):
+        t0 = p['t0'].to_numpy().astype(LANDSCAPE_DTYPE)
+        t1 = p['t1'].to_numpy().astype(LANDSCAPE_DTYPE)
+        x0 = p['x0'].to_numpy().astype(LANDSCAPE_DTYPE)
+        x1 = p['x1'].to_numpy().astype(LANDSCAPE_DTYPE)
+        out.append([{'t0': t0[i], 'x0': x0[i][np.newaxis, :],
+                     't1': t1[i], 'x1': x1[i][np.newaxis, :]}
+                    for i in range(len(p))])
+    return out
 
 
 def compute_rolling_means(cfg, target_df, dims):
@@ -75,7 +99,8 @@ def build_horizon_pairs(rolling_df, horizon_days, dims, tolerance_frac=0.25):
             pl.concat_arr([f'x1_{i}' for i in dims]).alias('x1'),
         ])\
         .rename({'t': 't0'})\
-        .select(['t0', 'x0', 't1', 'x1', 'filter_value', 'createtime'])
+        .select(['t0', 'x0', 't1', 'x1', 'filter_value', 'createtime',
+                 'future_createtime'])
 
     return paired
 
@@ -100,17 +125,27 @@ def load_target_df(cfg):
     return target_df
 
 
-def build_training_pairs(cfg, target_df):
+def build_training_pairs(cfg, target_df, smooth=True, max_step_days=10):
     """Build training-time 1-step pairs (rolling mean + 1-step shift + timestep<10d filter).
+
+    smooth=False skips the rolling mean, for latents that are already smooth in
+    time — smoothing them again would only widen the window over which x0 and
+    x1 share data.
+
+    max_step_days drops pairs that straddle a gap; it has to exceed the grid
+    spacing of whatever produced target_df.
 
     No shuffle here — apply_split shuffles for split_type='random'.
     """
     n_dims = cfg.n_dims
-    paired = target_df.with_columns([
+    wide = target_df.with_columns([
             pl.col('x0').arr.get(i).alias(f'x0_{i}') for i in range(n_dims)
-        ])\
-        .rolling('createtime', period=f'{cfg.rolling_mean_window}d', group_by='filter_value') \
-        .agg([pl.col(f'x0_{i}').mean() for i in range(n_dims)])\
+        ])
+    if smooth:
+        wide = wide.rolling('createtime', period=f'{cfg.rolling_mean_window}d',
+                            group_by='filter_value') \
+            .agg([pl.col(f'x0_{i}').mean() for i in range(n_dims)])
+    paired = wide\
         .with_columns(((pl.col('createtime') - INITIAL_DATE).dt.total_days() / UNIT_DAYS).alias('t0'))\
         .sort(['filter_value', 't0'])\
         .with_columns(
@@ -127,10 +162,78 @@ def build_training_pairs(cfg, target_df):
         .with_columns(
             (pl.col('next_createtime') - pl.col('createtime')).alias('timestep'),
         )\
-        .filter(pl.col('timestep') < pl.duration(days=10))\
+        .filter(pl.col('timestep') < pl.duration(days=max_step_days))\
         .drop(['timestep'])
 
     return paired
+
+
+def split_spec(cfg):
+    """The nested trajectory x time split this run is allowed to see."""
+    return splits.SplitSpec(holdout_days=cfg.split.holdout_days,
+                            train_frac=cfg.split.train_frac,
+                            val_frac=cfg.split.val_frac,
+                            seed=cfg.split.seed)
+
+
+def latent_config(cfg):
+    return LatentConfig(
+        cells_path=cfg.latents.cells_path,
+        n_dims=cfg.n_dims,
+        n_fast=cfg.latents.n_fast,
+        fast_tau=cfg.latents.fast_tau,
+        slow_kind=cfg.latents.slow_kind,
+        slow_tau=cfg.latents.slow_tau,
+        bin_factor=cfg.latents.bin_factor,
+        interp_days=cfg.latents.interp_days,
+        rho=cfg.latents.rho,
+        iters=cfg.latents.iters,
+        infer_iters=cfg.latents.infer_iters,
+        min_target_volume=cfg.min_target_volume,
+        seed=cfg.latents.seed,
+    )
+
+
+def load_latent_df(cfg, spec):
+    """Trajectories in latent space, fitted inside the split boundary.
+
+    The latent-GP factor model is fitted here rather than read from disk so
+    that its global parameters only ever see training trajectories inside the
+    training period; precomputed coords cannot make that guarantee.
+    """
+    if cfg.latents.method != 'gpfa':
+        return load_target_df(cfg)
+
+    lcfg = latent_config(cfg)
+    traj = splits.assign_trajectory_split(gp_cells.seed_names(lcfg.cells_path), spec)
+    seed_split = dict(zip(traj['filter_value'].to_list(),
+                          traj['traj_split'].to_list()))
+    df = build_latents(lcfg, spec, seed_split, cache_dir=cfg.latents.cache_dir,
+                       log=logger.info)
+
+    coord, causal, _ = coord_cols(cfg.n_dims)
+    state = causal if cfg.latents.causal_state else coord
+    if cfg.platform != 'all':
+        df = df.filter(pl.col('filter_value').cast(pl.String)
+                       .str.to_lowercase().str.contains(f'-{cfg.platform}-'))
+    return df.filter(pl.col('filter_value') != '')\
+        .select(['createtime', 'filter_value', state])\
+        .sort(['filter_value', 'createtime'])\
+        .rename({state: 'x0'})
+
+
+def run_dir(cfg):
+    """Output directory, keyed by everything that changes what the model sees."""
+    trend_name = os.path.basename(cfg.trend_path.rstrip('/'))
+    parts = [f'dims_{"_".join(str(d) for d in range(cfg.n_dims))}']
+    if cfg.platform != 'all':
+        parts.append(cfg.platform)
+    if cfg.latents.method == 'gpfa':
+        parts.append(f'gpfa{latent_config(cfg).tag}')
+    elif cfg.rolling_mean_window != 100:
+        parts.append(f'rm{cfg.rolling_mean_window}')
+    parts.append(split_spec(cfg).tag)
+    return os.path.join('.', 'out', trend_name, '_'.join(parts))
 
 
 def compute_training_split(cfg, target_df=None):
@@ -163,12 +266,23 @@ def compute_training_split(cfg, target_df=None):
         raise ValueError(f"Unknown split_type: {cfg.split_type}. Must be 'random', 'filter_value', or 'time'")
 
 
-def apply_split(df, split_type, train_fraction, val_filter_values=None, cutoff_time=None):
+def apply_split(df, split_type, train_fraction, val_filter_values=None,
+                cutoff_time=None, spec=None, scenario='val_out'):
     """Split df into train/val using metadata from compute_training_split.
 
     For 'random', shuffles df with seed=42 then takes head/tail.
     For 'filter_value' / 'time', filters df by val_filter_values / cutoff_time.
+    For 'nested', `spec` and `scenario` select one cell of the trajectory x time
+    design; the returned 'val' half is that cell.
     """
+    if split_type == 'nested':
+        if spec is None:
+            raise ValueError("split_type='nested' requires a SplitSpec")
+        time_col = ('future_createtime' if 'future_createtime' in df.columns
+                    else 'next_createtime')
+        labelled = splits.label_pairs(df, spec, time_col=time_col)
+        traj, time = scenario.rsplit('_', 1)
+        return splits.training_rows(labelled), splits.select(labelled, traj, time)
     if split_type == 'random':
         df = df.sample(fraction=1.0, shuffle=True, seed=42)
         n_train = int(len(df) * train_fraction)
@@ -217,82 +331,93 @@ def compute_metrics(model_losses, baseline_losses):
     }
 
 
-def evaluate_horizon(model, paired_df, cfg, key, horizon_days, n_dims, seed_df,
-                     split_type, train_fraction, val_filter_values=None, cutoff_time=None):
-    """Evaluate model at a given horizon with breakdowns by dimension, MainType, Party."""
-    prefix = f"horizon_{horizon_days}d"
-    logger.info(f"Running {horizon_days}-day horizon evaluation...")
+def scenario_subsets(cell, n_dims, seed_df, breakdowns):
+    """The (name, rows) pairs to score for one scenario cell."""
+    cell = cell.with_columns(pl.col('filter_value').cast(pl.String)) \
+        .join(seed_df, left_on='filter_value', right_on='SeedName', how='left') \
+        .with_columns([pl.col('x0').arr.get(i).alias(f'x0_{i}') for i in range(n_dims)])
+    subsets = [('overall', cell)]
+    if not breakdowns:
+        return subsets
 
-    if len(paired_df) == 0:
-        logger.info(f"  {horizon_days}d: no pairs found, skipping")
-        return
-
-    _, val_paired = apply_split(
-        paired_df, split_type, train_fraction,
-        val_filter_values=val_filter_values, cutoff_time=cutoff_time,
-    )
-
-    # Join seed metadata for breakdowns
-    val_paired = val_paired.with_columns(pl.col('filter_value').cast(pl.String)) \
-        .join(seed_df, left_on='filter_value', right_on='SeedName', how='left')
-
-    # Compute per-dimension x0 columns for mean splits
-    dim_cols = [f'x0_{i}' for i in range(n_dims)]
-    val_paired = val_paired.with_columns([
-        pl.col('x0').arr.get(i).alias(f'x0_{i}') for i in range(n_dims)
-    ])
-
-    # Compute dimension means for above/below splits
-    dim_means = {f'x0_{i}': val_paired[f'x0_{i}'].mean() for i in range(n_dims)}
-
-    # Build all evaluation subsets: overall + breakdowns
-    subsets = [('overall', val_paired)]
-
-    # Above/below mean on each dimension
     for i in range(n_dims):
         col = f'x0_{i}'
-        mean_val = dim_means[col]
-        subsets.append((f'dim{i}_above_mean', val_paired.filter(pl.col(col) >= mean_val)))
-        subsets.append((f'dim{i}_below_mean', val_paired.filter(pl.col(col) < mean_val)))
+        mean_val = cell[col].mean()
+        subsets.append((f'dim{i}_above_mean', cell.filter(pl.col(col) >= mean_val)))
+        subsets.append((f'dim{i}_below_mean', cell.filter(pl.col(col) < mean_val)))
 
-    # Categorical breakdowns
     for col in ['MainType', 'SubType', 'Party']:
-        if col not in val_paired.columns:
+        if col not in cell.columns:
             continue
-        for val in val_paired.drop_nulls(col).filter(pl.col(col) != '')[col].unique().sort().to_list():
-            subsets.append((f'{col}_{val}', val_paired.filter(pl.col(col) == val)))
+        for val in cell.drop_nulls(col).filter(pl.col(col) != '')[col].unique().sort().to_list():
+            subsets.append((f'{col}_{val}', cell.filter(pl.col(col) == val)))
+    return subsets
 
+
+def evaluate_scenarios(model, labelled, cfg, key, n_dims, seed_df, prefix,
+                       breakdown_scenario=None):
+    """Score every scenario cell of the nested split and log it to wandb.
+
+    Skill against the no-movement baseline is the headline rather than raw MSE:
+    a smoother latent lowers both, so MSE would reward smoothing the latent
+    into a constant, while skill is roughly invariant to it.
+    """
+    train = splits.training_rows(labelled)
     wandb_metrics = {}
-    for subset_name, subset_df in subsets:
-        if len(subset_df) == 0:
-            logger.info(f"  {prefix}/{subset_name}: no samples, skipping")
-            continue
+    results = {}
 
-        subset_data = df_to_data(subset_df)
-        subset_dataset = LandscapeSimulationDataset(data=subset_data)
-        subset_loader = NumpyLoader(
-            subset_dataset,
-            batch_size=min(cfg.eval_batch_size, len(subset_dataset)),
-            shuffle=False,
-        )
+    for traj in splits.TRAJ_SPLITS:
+        for time in splits.TIME_SPLITS:
+            name = splits.scenario_name(traj, time)
+            cell = splits.select(labelled, traj, time)
+            splits.check_leakage(train, cell, name)
+            if len(cell) == 0:
+                logger.info(f'  {prefix}/{name}: no pairs, skipping')
+                continue
 
-        key, subkey = jax.random.split(key)
-        model_losses, baseline_losses = evaluate_dataloader(model, subset_loader, subkey)
-        metrics = compute_metrics(model_losses, baseline_losses)
-
-        logger.info(
-            f"  {prefix}/{subset_name}: model_mse={metrics['model_mse']:.6f} "
-            f"baseline_mse={metrics['baseline_mse']:.6f} skill={metrics['skill_score']:.4f} "
-            f"frac_better={metrics['frac_better']:.3f} n={metrics['n']}"
-        )
-        if subset_name == 'overall':
-            for k, v in metrics.items():
-                wandb_metrics[f"{prefix}/{k}"] = v
-        for k, v in metrics.items():
-            wandb_metrics[f"{prefix}/{subset_name}/{k}"] = v
+            for sub_name, sub in scenario_subsets(
+                    cell, n_dims, seed_df, breakdowns=(name == breakdown_scenario)):
+                if len(sub) == 0:
+                    continue
+                loader = NumpyLoader(
+                    LandscapeSimulationDataset(data=df_to_data(sub)),
+                    batch_size=min(cfg.eval_batch_size, len(sub)), shuffle=False)
+                key, subkey = jax.random.split(key)
+                metrics = compute_metrics(*evaluate_dataloader(model, loader, subkey))
+                if sub_name == 'overall':
+                    results[name] = metrics
+                    logger.info(
+                        f"  {prefix}/{name}: skill={metrics['skill_score']:.4f} "
+                        f"model_mse={metrics['model_mse']:.6f} "
+                        f"baseline_mse={metrics['baseline_mse']:.6f} "
+                        f"frac_better={metrics['frac_better']:.3f} n={metrics['n']}")
+                for k, v in metrics.items():
+                    tag = f'{prefix}/{name}' if sub_name == 'overall' \
+                        else f'{prefix}/{name}/{sub_name}'
+                    wandb_metrics[f'{tag}/{k}'] = v
 
     for k, v in wandb_metrics.items():
         wandb.run.summary[k] = v
+    return results
+
+
+def write_scenario_metrics(results, cfg, dir_path, prefix):
+    """Persist scenario scores next to the checkpoint.
+
+    The rolling-holdout comparison needs these across runs, and reading them
+    back from disk keeps it independent of whether wandb was reachable.
+    """
+    rows = [dict(scenario=name, prefix=prefix,
+                 holdout_days=cfg.split.holdout_days, n_dims=cfg.n_dims,
+                 n_fast=cfg.latents.n_fast, fast_tau=cfg.latents.fast_tau,
+                 slow_kind=cfg.latents.slow_kind, **m)
+            for name, m in results.items()]
+    if not rows:
+        return
+    os.makedirs(dir_path, exist_ok=True)
+    path = os.path.join(dir_path, f'scenario_metrics_{prefix}.parquet.zstd')
+    pl.from_dicts(rows).write_parquet(path, compression='zstd')
+    logger.info(f'wrote {path}')
 
 
 def compute_per_sample_mse(y_pred, y_true):
@@ -336,84 +461,67 @@ def main(cfg):
     wandb_config = omegaconf.OmegaConf.to_object(cfg)
     wandb.init(project=project_name, config=wandb_config)
 
-    logger.info("Loading data...")
-
     n_dims = cfg.n_dims
-    trend_name = os.path.basename(cfg.trend_path.rstrip('/'))
+    spec = split_spec(cfg)
+    dir_path = run_dir(cfg)
+    logger.info(f'split {spec}  ->  {dir_path}')
 
-    if cfg.platform != 'all':
-        dir_path = f'./out/{trend_name}/dims_{"_".join([str(d) for d in range(n_dims)])}_{cfg.platform}'
-    else:
-        dir_path = f'./out/{trend_name}/dims_{"_".join([str(d) for d in range(n_dims)])}'
+    if cfg.latents.method != 'gpfa':
+        logger.warning(
+            'precomputed coords were fitted over all trajectories and all time, '
+            'so held-out scenarios are only held out of the landscape model, '
+            'not of the representation')
 
-    if cfg.rolling_mean_window != 100:
-        dir_path = f"{dir_path}_rm{cfg.rolling_mean_window}"
+    target_df = load_latent_df(cfg, spec)
+    smooth = cfg.latents.method != 'gpfa'
+    rolling_df = compute_rolling_means(cfg, target_df, list(range(n_dims))) if smooth \
+        else target_df.with_columns([
+            pl.col('x0').arr.get(i).alias(f'x0_{i}') for i in range(n_dims)
+        ] + [((pl.col('createtime') - INITIAL_DATE).dt.total_days() / UNIT_DAYS).alias('t')])
 
-    target_df = load_target_df(cfg)
+    grid_days = cfg.latents.interp_days or 2 * cfg.latents.bin_factor
+    pairs = build_training_pairs(
+        cfg, target_df, smooth=smooth,
+        max_step_days=10 if smooth else 1.5 * grid_days)
+    labelled = splits.label_pairs(pairs, spec, time_col='next_createtime')
+    logger.info('pair counts by scenario:\n' + str(splits.summarise(labelled)))
 
-    # Keep rolling mean df for horizon evaluation after training
-    rolling_df = compute_rolling_means(cfg, target_df, list(range(n_dims)))
+    train_df = splits.training_rows(labelled)
+    # Early stopping uses every validation trajectory, in and out of time: the
+    # out-of-time cell alone is too small to stop on at short holdout windows.
+    val_df = splits.select(labelled, 'val', splits.TIME_SPLITS)
+    if len(train_df) == 0 or len(val_df) == 0:
+        raise ValueError(f'empty train ({len(train_df)}) or val ({len(val_df)}) set')
 
-    target_df = build_training_pairs(cfg, target_df)
-
-    val_filter_values, cutoff_time = compute_training_split(cfg, target_df=target_df)
-    train_df, val_df = apply_split(
-        target_df, cfg.split_type, cfg.train_fraction,
-        val_filter_values=val_filter_values, cutoff_time=cutoff_time,
-    )
-
-    train_data = df_to_data(train_df)
-    val_data = df_to_data(val_df)
-    train_dataset = LandscapeSimulationDataset(
-        data=train_data
-    )
-
-    valid_dataset = LandscapeSimulationDataset(
-        data=val_data
-    )
-
-    shuffle_train = True
-    shuffle_valid = False
+    train_dataset = LandscapeSimulationDataset(data=df_to_data(train_df))
+    valid_dataset = LandscapeSimulationDataset(data=df_to_data(val_df))
 
     batch_size = cfg.batch_size
-    batch_size_train = batch_size
-    batch_size_valid = batch_size
-
     train_dataloader = NumpyLoader(
-        train_dataset, 
-        batch_size=min(batch_size_train, len(train_dataset)), 
-        shuffle=shuffle_train,
-    )
-
+        train_dataset, batch_size=min(batch_size, len(train_dataset)), shuffle=True)
     valid_dataloader = NumpyLoader(
-        valid_dataset, 
-        batch_size=min(batch_size_valid, len(valid_dataset)), 
-        shuffle=shuffle_valid,
-    )
+        valid_dataset, batch_size=min(batch_size, len(valid_dataset)), shuffle=False)
 
-    # Get dt schedule
     scheduler_kwargs = {
         'dt': cfg.dt,
         'dt_schedule_bounds': [0, 1],
         'dt_schedule_scales': [1.0, 0.1]
     }
-    schedule_type = 'stepped'
-    dt_schedule = get_dt_schedule(schedule_type, scheduler_kwargs)
+    dt_schedule = get_dt_schedule('stepped', scheduler_kwargs)
 
-    seed = 42
-    rng = np.random.default_rng(seed=seed)
+    rng = np.random.default_rng(seed=42)
     key = jax.random.PRNGKey(int(rng.integers(2**32)))
     key, modelkey, initkey, trainkey = jax.random.split(key, 4)
 
-    confinement_threshold = np.max(np.linalg.norm(target_df['x0'].to_numpy(), axis=1)) * 1.1
+    # Confinement is set from the training states only; the holdout must not
+    # get to widen the box it is scored inside.
+    confinement_threshold = np.max(np.linalg.norm(train_df['x0'].to_numpy(), axis=1)) * 1.1
 
-    model_type = 'deep_phi'
     dtype = jnp.float32
-    cont_path = cfg.cont_path
     args_make = {
-        'ndims' : n_dims, 
-        'nparams' : n_dims, 
-        'ncells' : len(train_dataset), 
+        'ndims' : n_dims,
+        'nparams' : n_dims,
+        'ncells' : len(train_dataset),
         'sigma_init' : cfg.sigma,
         'confine' : cfg.confine,
         'confinement_factor' : cfg.confinement_factor,
@@ -424,111 +532,89 @@ def main(cfg):
         'dt_max' : cfg.dt_max,
         'solver' : cfg.solver,
         'sample_cells' : cfg.model_do_sample,
+        'include_phi_bias' : False,
+        'phi_hidden_dims' : list(cfg.phi_hidden_dims),
+        'phi_hidden_acts' : cfg.phi_hidden_acts,
+        'phi_final_act' : cfg.phi_final_act,
+        'phi_layer_normalize' : cfg.phi_layer_normalize,
+        'phi_layer_dropout' : cfg.phi_layer_dropout,
     }
-    args_init = {}
+    args_init = {
+        'init_phi_weights_method' : cfg.init_phi_weights_method,
+        'init_phi_weights_args' : cfg.init_phi_weights_args,
+        'init_phi_bias_method' : cfg.init_phi_bias_method,
+        'init_phi_bias_args' : cfg.init_phi_bias_args,
+    }
 
-    # Add extra args based on Deep or GMM PLNN
-    if model_type in ['deep_phi', 'ne_deep_phi', 'vae_plnn']:
-        args_make.update({
-            'include_phi_bias' : False,
-            'phi_hidden_dims' : list(cfg.phi_hidden_dims),
-            'phi_hidden_acts' : cfg.phi_hidden_acts,
-            'phi_final_act' : cfg.phi_final_act,
-            'phi_layer_normalize' : cfg.phi_layer_normalize,
-            'phi_layer_dropout' : cfg.phi_layer_dropout,
-        })
-        args_init.update({
-            'init_phi_weights_method' : cfg.init_phi_weights_method,
-            'init_phi_weights_args' : cfg.init_phi_weights_args,
-            'init_phi_bias_method' : cfg.init_phi_bias_method,
-            'init_phi_bias_args' : cfg.init_phi_bias_args,
-        })
-
-    if cont_path:
-        # Load previous model
-        logger.info(f"Loading model from {cont_path}...")
-        model, hyperparams = DeepTimePhiPLNN.load(cont_path, dtype=dtype)
+    if cfg.cont_path:
+        logger.info(f'Loading model from {cfg.cont_path}...')
+        model, hyperparams = DeepTimePhiPLNN.load(cfg.cont_path, dtype=dtype)
         if cfg.dt > 0:
-            logger.info(
-                f"Overwriting loaded model's dt0. " \
-                f"Was {model.dt0}. Now {cfg.dt}."
-            )
+            logger.info(f"Overwriting loaded model's dt0. Was {model.dt0}. Now {cfg.dt}.")
             model = eqx.tree_at(lambda m: m.dt0, model, cfg.dt)
             hyperparams['dt0'] = cfg.dt
     else:
-        # Construct and initialize the model
-        logger.info("Constructing new model...")
-        model, hyperparams = DeepTimePhiPLNN.make_model(
-            key=modelkey, dtype=dtype,
-            **args_make
-        )
-        model = model.initialize(
-            initkey, dtype=dtype, **args_init
-        )
+        logger.info('Constructing new model...')
+        model, hyperparams = DeepTimePhiPLNN.make_model(key=modelkey, dtype=dtype, **args_make)
+        model = model.initialize(initkey, dtype=dtype, **args_init)
 
-    # Get the loss function
-    loss_fn = select_loss_function(
-        cfg.loss_fn_key, 
-        kernel=cfg.loss_fn_kernel,
-        bw_range=cfg.loss_fn_bw,
-    )
-
-    # Optimizer construction
-    optimizer_args = get_optimizer_args(cfg, cfg.num_epochs)
-
-    optimization_method = 'rms'
+    loss_fn = select_loss_function(cfg.loss_fn_key, kernel=cfg.loss_fn_kernel,
+                                   bw_range=cfg.loss_fn_bw)
     optimizer = select_optimizer(
-        optimization_method, optimizer_args,
-        batch_size=batch_size, dataset_size=len(train_dataset),
-    )
+        'rms', get_optimizer_args(cfg, cfg.num_epochs),
+        batch_size=batch_size, dataset_size=len(train_dataset))
 
-    # Plotting kwargs
     plotting_opts = {
         'equal_axes': True,
         'plot_radius': cfg.plot_radius,
         'plot_losses': True,
         'plot_sigma_hist': True,
-        'sigma_true': None,  # TODO: include true value of sigma if given.
+        'sigma_true': None,
     }
 
     model = train_model(
-        model,
-        loss_fn,
-        optimizer,
-        train_dataloader,
-        valid_dataloader,
-        key=trainkey,
-        num_epochs=cfg.num_epochs,
-        batch_size=batch_size,
-        min_epochs=cfg.min_epochs,
-        patience=cfg.patience,
-        dt_schedule=dt_schedule,
-        hyperparams=hyperparams,
-        plotting_opts=plotting_opts,
-        reduce_dt_on_nan=True,
-        reduce_cf_on_nan=True,
-        logprint=logger.info,
-        outdir=dir_path
+        model, loss_fn, optimizer, train_dataloader, valid_dataloader,
+        key=trainkey, num_epochs=cfg.num_epochs, batch_size=batch_size,
+        min_epochs=cfg.min_epochs, patience=cfg.patience, dt_schedule=dt_schedule,
+        hyperparams=hyperparams, plotting_opts=plotting_opts,
+        reduce_dt_on_nan=True, reduce_cf_on_nan=True,
+        logprint=logger.info, outdir=dir_path,
     )
 
-    # Load seed metadata for evaluation breakdowns
     seed_df = load_seed_metadata(cfg)
+    key, evalkey = jax.random.split(key)
+    scored = {}
+    scored['step'] = evaluate_scenarios(
+        model, labelled, cfg, evalkey, n_dims, seed_df, prefix='step',
+        breakdown_scenario=cfg.breakdown_scenario)
+    write_scenario_metrics(scored['step'], cfg, dir_path, 'step')
 
-    # Common kwargs for evaluate_horizon
-    eval_kwargs = dict(
-        model=model, cfg=cfg, n_dims=n_dims, seed_df=seed_df,
-        split_type=cfg.split_type, train_fraction=cfg.train_fraction,
-        val_filter_values=val_filter_values if cfg.split_type == 'filter_value' else None,
-        cutoff_time=cutoff_time if cfg.split_type == 'time' else None,
-    )
-
-    # 7-day and 30-day horizon evaluations
-    for horizon_days in [7, 30]:
+    for horizon_days in cfg.eval_horizons:
         key, evalkey = jax.random.split(key)
-        paired_df = build_horizon_pairs(rolling_df, horizon_days, list(range(n_dims)))
-        evaluate_horizon(paired_df=paired_df, key=evalkey, horizon_days=horizon_days, **eval_kwargs)
+        paired = build_horizon_pairs(rolling_df, horizon_days, list(range(n_dims)))
+        if len(paired) == 0:
+            logger.info(f'{horizon_days}d: no pairs found, skipping')
+            continue
+        prefix = f'horizon_{horizon_days}d'
+        scored[prefix] = evaluate_scenarios(
+            model, splits.label_pairs(paired, spec, time_col='future_createtime'),
+            cfg, evalkey, n_dims, seed_df, prefix=prefix)
+        write_scenario_metrics(scored[prefix], cfg, dir_path, prefix)
+
+    # Sweeps select on val_out and report test_out once; selecting on test_out
+    # would spend the only estimate that is clean in both dimensions.
+    obj_key = f'{cfg.objective_prefix}/{cfg.objective_scenario}/{cfg.objective_metric}'
+    objective = scored.get(cfg.objective_prefix, {}) \
+        .get(cfg.objective_scenario, {}).get(cfg.objective_metric)
+    if objective is None:
+        logger.warning(f'objective {obj_key} unavailable; '
+                       'the sweep has nothing to optimise')
+    else:
+        wandb.run.summary['objective'] = objective
+        logger.info(f'objective ({obj_key}) = {objective:.5f}')
 
     wandb.finish()
-    
+
+
 if __name__ == '__main__':
     main()

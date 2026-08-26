@@ -1,0 +1,46 @@
+# Keys the nested-split training path requires.
+#
+# config/ is gitignored, so these live here to stay under version control;
+# paste them into config/config.yaml on each machine.
+
+n_dims: 6
+
+# Nested trajectory x time split. Trajectories are hashed into train/val/test;
+# a pair is out-of-time when its target t1 lands in the last holdout_days.
+split:
+  holdout_days: 365
+  train_frac: 0.70
+  val_frac: 0.10
+  seed: 42
+
+# Latent trajectories. 'gpfa' fits the latent-GP factor model inside the split
+# boundary, so held-out trajectories never reach the representation; 'ppca'
+# reads coords precomputed over everything and cannot make that guarantee.
+latents:
+  method: gpfa
+  cells_path: 'tmp/gpfa_all_cells.parquet.zstd'
+  cache_dir: 'tmp/latents'
+  bin_factor: 8                  # latent grid spacing = 2 * bin_factor days
+  interp_days: 2.0               # resample onto this spacing; 0 keeps the bin grid
+  n_fast: 2                      # dimensions with drifting dynamics; the rest are slow
+  fast_tau: 80.0
+  slow_kind: const               # const (frozen) or wiener
+  slow_tau: 2560.0
+  rho: 0.0                       # within-cell overdispersion; 0 = iid per post
+  iters: 25
+  infer_iters: 15
+  causal_state: false            # true = filtered state, which cannot see its own future
+  seed: 0
+
+# Skill, not MSE: a smoother latent lowers model and baseline error together,
+# so optimising MSE would select for smoothing the latent into a constant.
+#
+# Scored at a horizon rather than one step: on a 2-day grid the latent barely
+# moves between consecutive points, so 1-step skill is measured where there is
+# almost no motion to predict. The horizon has to be fixed across the sweep,
+# not matched to each trial's own timescale.
+objective_prefix: horizon_90d
+objective_scenario: val_out
+objective_metric: skill_score
+breakdown_scenario: null       # per-dimension/type breakdowns; off for sweeps
+eval_horizons: [30, 90, 180]

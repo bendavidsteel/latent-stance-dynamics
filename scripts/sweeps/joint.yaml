@@ -1,0 +1,78 @@
+# Joint sweep over the latent-GP factor model and the landscape model.
+#
+# Both are fitted in one process, so the representation is re-fitted inside the
+# split boundary for every trial and held-out trajectories never reach it.
+#
+# The objective is skill against the no-movement baseline on val_out (unseen
+# trajectory, unseen time), not MSE: a smoother latent lowers model and
+# baseline error together, so an MSE objective would drive the latent toward a
+# constant and reward itself for it.
+#
+# GPFA parameters are discrete so that trials sharing a latent configuration
+# hit the on-disk cache and only pay for landscape training.
+#
+#   wandb sweep config/sweep_joint.yaml
+#   wandb agent <entity>/potential_landscape_training/<sweep_id>
+
+program: scripts/flows/nn_potential.py
+method: bayes
+metric:
+  name: objective
+  goal: maximize
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+
+parameters:
+  # --- fixed for every trial ---
+  # Only the objective horizon is scored: integrating the SDE over 90 days
+  # costs about ten times a single step, so extra horizons are for final runs.
+  eval_horizons:
+    value: [90]
+  breakdown_scenario:
+    value: null
+
+  # --- latent-GP factor model ---
+  n_dims:
+    values: [3, 4, 5, 6, 8]
+  latents.n_fast:
+    values: [0, 1, 2, 3]
+  latents.fast_tau:
+    values: [40.0, 80.0, 160.0]
+  latents.slow_kind:
+    values: [const, wiener]
+  latents.bin_factor:
+    values: [4, 8, 16]
+
+  # --- landscape model ---
+  sigma:
+    distribution: log_uniform_values
+    min: 0.05
+    max: 1.0
+  confinement_factor:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-1
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 5e-2
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-1
+  phi_layer_dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.2
+  phi_hidden_dims:
+    values: [[64, 64, 64], [128, 128, 128, 128], [256, 256, 256]]
+  batch_size:
+    values: [256, 512, 1024]
+
+early_terminate:
+  type: hyperband
+  min_iter: 20
