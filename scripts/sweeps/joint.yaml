@@ -3,10 +3,13 @@
 # Both are fitted in one process, so the representation is re-fitted inside the
 # split boundary for every trial and held-out trajectories never reach it.
 #
-# The objective is skill against the no-movement baseline on val_out (unseen
-# trajectory, unseen time), not MSE: a smoother latent lowers model and
-# baseline error together, so an MSE objective would drive the latent toward a
-# constant and reward itself for it.
+# The objective is skill_ceiling = rho^2 on val_out (unseen trajectory, unseen
+# time), where rho is the correlation between predicted and observed
+# displacement. MSE is out because a smoother latent lowers model and baseline
+# error together, so it would drive the latent toward a constant and reward
+# itself for it. Plain skill is out because it vanishes as the drift does: the
+# landscape model collapses to the identity within one epoch, and skill cannot
+# tell that apart from a model that simply does not help.
 #
 # GPFA parameters are discrete so that trials sharing a latent configuration
 # hit the on-disk cache and only pay for landscape training.

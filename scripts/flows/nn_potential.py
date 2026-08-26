@@ -316,19 +316,58 @@ def load_seed_metadata(cfg):
     ]).unique('SeedName')
 
 
-def compute_metrics(model_losses, baseline_losses):
-    """Compute standard evaluation metrics from per-sample losses."""
+def compute_metrics(model_losses, baseline_losses, pred_losses=None, dots=None):
+    """Evaluation metrics from per-sample losses, mean and median based.
+
+    The mean ratio is dominated by the minority of pairs with a near-zero
+    baseline, so it can be negative while the model beats the baseline on most
+    pairs. median_skill and frac_better say what happens typically; skill_score
+    says what happens to the total.
+
+    Given the displacement statistics, skill decomposes exactly. Writing
+    d = x1 - x0 for the observed motion and p = xhat - x0 for the predicted,
+
+        skill = 2 * rho * R - R^2
+
+    with R = sqrt(E|p|^2 / E|d|^2) the amplitude ratio and rho the correlation
+    between predicted and observed motion. Skill therefore goes to zero as
+    p -> 0 whatever the model has learned, which is what makes a collapsed
+    model indistinguishable from a merely unhelpful one. rho does not: it is
+    scale free, and skill_ceiling = rho^2 is the best skill any rescaling of
+    this drift field could reach, attained at R = rho. A model with real
+    direction and the wrong amplitude is a tuning problem; rho near zero means
+    there is no direction to find.
+    """
     model_mse = float(np.mean(model_losses))
     baseline_mse = float(np.mean(baseline_losses))
-    skill = 1.0 - model_mse / baseline_mse if baseline_mse > 0 else 0.0
-    frac_better = float(np.mean(model_losses < baseline_losses))
-    return {
+    model_med = float(np.median(model_losses))
+    baseline_med = float(np.median(baseline_losses))
+    out = {
         'model_mse': model_mse,
         'baseline_mse': baseline_mse,
-        'skill_score': skill,
-        'frac_better': frac_better,
+        'skill_score': 1.0 - model_mse / baseline_mse if baseline_mse > 0 else 0.0,
+        'model_median': model_med,
+        'baseline_median': baseline_med,
+        'median_skill': 1.0 - model_med / baseline_med if baseline_med > 0 else 0.0,
+        'frac_better': float(np.mean(model_losses < baseline_losses)),
         'n': len(model_losses),
     }
+    if pred_losses is None or dots is None:
+        return out
+
+    d2 = float(np.mean(baseline_losses))
+    p2 = float(np.mean(pred_losses))
+    c = float(np.mean(dots))
+    rho = c / np.sqrt(d2 * p2) if d2 > 0 and p2 > 0 else 0.0
+    ratio = np.sqrt(p2 / d2) if d2 > 0 else 0.0
+    out.update({
+        'displacement_ratio': float(ratio),
+        'direction_rho': float(rho),
+        'skill_ceiling': float(rho ** 2),
+        # 1.0 means the drift is already scaled the way the correlation warrants
+        'amplitude_vs_optimal': float(ratio / rho) if rho > 0 else float('inf'),
+    })
+    return out
 
 
 def scenario_subsets(cell, n_dims, seed_df, breakdowns):
@@ -383,13 +422,16 @@ def evaluate_scenarios(model, labelled, cfg, key, n_dims, seed_df, prefix,
                     LandscapeSimulationDataset(data=df_to_data(sub)),
                     batch_size=min(cfg.eval_batch_size, len(sub)), shuffle=False)
                 key, subkey = jax.random.split(key)
-                metrics = compute_metrics(*evaluate_dataloader(model, loader, subkey))
+                metrics = compute_metrics(*evaluate_dataloader(
+                    model, loader, subkey, with_displacement=True))
                 if sub_name == 'overall':
                     results[name] = metrics
                     logger.info(
-                        f"  {prefix}/{name}: skill={metrics['skill_score']:.4f} "
-                        f"model_mse={metrics['model_mse']:.6f} "
-                        f"baseline_mse={metrics['baseline_mse']:.6f} "
+                        f"  {prefix}/{name}: ceiling={metrics['skill_ceiling']:.5f} "
+                        f"rho={metrics['direction_rho']:+.4f} "
+                        f"R={metrics['displacement_ratio']:.5f} "
+                        f"skill={metrics['skill_score']:+.5f} "
+                        f"median_skill={metrics['median_skill']:+.5f} "
                         f"frac_better={metrics['frac_better']:.3f} n={metrics['n']}")
                 for k, v in metrics.items():
                     tag = f'{prefix}/{name}' if sub_name == 'overall' \
@@ -427,33 +469,53 @@ def compute_per_sample_mse(y_pred, y_true):
 
 @eqx.filter_jit
 def _eval_batch(model, t0, t1, y0, y1, key):
-    """JIT-compiled evaluation of a single batch."""
+    """JIT-compiled evaluation of a single batch.
+
+    d.p is accumulated directly rather than recovered from the three squared
+    norms: in float32 those differ by far less than their own magnitude, so the
+    subtraction would keep almost none of its precision.
+    """
     y_pred = model(t0, t1, y0, key)
+    p = y_pred - y0
+    d = y1 - y0
     model_mse = compute_per_sample_mse(y_pred, y1)
     baseline_mse = compute_per_sample_mse(y0, y1)
-    return model_mse, baseline_mse
+    pred_mse = jnp.sum(jnp.square(p), axis=(-2, -1))
+    dot = jnp.sum(d * p, axis=(-2, -1))
+    return model_mse, baseline_mse, pred_mse, dot
 
 
-def evaluate_dataloader(model, dataloader, key):
+def evaluate_dataloader(model, dataloader, key, with_displacement=False):
     """Evaluate model and no-movement baseline on a dataloader.
 
-    Returns arrays of per-sample MSE for the model and for the baseline.
+    Returns arrays of per-sample MSE for the model and for the baseline, and
+    with_displacement also the predicted squared displacement and its dot
+    product with the observed one, which compute_metrics turns into rho and R.
     """
     inference_model = eqx.tree_inference(model, True)
     model_losses = []
     baseline_losses = []
+    pred_losses = []
+    dots = []
 
     for data in tqdm(dataloader, desc="    Batches"):
         inputs, y1 = data
         t0, y0, t1 = inputs
 
         key, subkey = jax.random.split(key)
-        model_mse, baseline_mse = _eval_batch(inference_model, t0, t1, y0, y1, subkey)
+        model_mse, baseline_mse, pred_mse, dot = _eval_batch(
+            inference_model, t0, t1, y0, y1, subkey)
 
         model_losses.append(np.array(model_mse))
         baseline_losses.append(np.array(baseline_mse))
+        if with_displacement:
+            pred_losses.append(np.array(pred_mse))
+            dots.append(np.array(dot))
 
-    return np.concatenate(model_losses), np.concatenate(baseline_losses)
+    out = (np.concatenate(model_losses), np.concatenate(baseline_losses))
+    if with_displacement:
+        out = out + (np.concatenate(pred_losses), np.concatenate(dots))
+    return out
 
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(cfg):

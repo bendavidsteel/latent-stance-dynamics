@@ -51,6 +51,30 @@ def make_cfg(cells_path, cache_dir):
     })
 
 
+def check_displacement_identity():
+    """skill = 2*rho*R - R^2 must hold exactly, and rho^2 must bound skill."""
+    rng = np.random.default_rng(0)
+    n, K = 20_000, 6
+    d = rng.normal(size=(n, K))
+    for alpha, noise_sd in ((0.0, 0.0), (0.0, 0.3), (0.05, 0.3), (0.5, 0.3), (2.0, 0.1)):
+        p = alpha * d + noise_sd * rng.normal(size=(n, K))
+        m = nnp.compute_metrics(((d - p) ** 2).sum(1), (d ** 2).sum(1),
+                                (p ** 2).sum(1), (d * p).sum(1))
+        rho, R = m['direction_rho'], m['displacement_ratio']
+        assert abs(m['skill_score'] - (2 * rho * R - R ** 2)) < 1e-9, (alpha, m)
+        assert m['skill_ceiling'] + 1e-12 >= m['skill_score'], (alpha, m)
+        assert abs(m['skill_ceiling'] - rho ** 2) < 1e-12
+        print(f'  alpha={alpha:<4} rho={rho:+.4f} R={R:.4f} '
+              f'skill={m["skill_score"]:+.5f} ceiling={m["skill_ceiling"]:.5f}')
+
+    # a fully collapsed model must read as collapsed, not as merely unhelpful
+    m = nnp.compute_metrics((d ** 2).sum(1), (d ** 2).sum(1),
+                            np.zeros(n), np.zeros(n))
+    assert m['displacement_ratio'] == 0.0 and m['direction_rho'] == 0.0
+    assert m['skill_ceiling'] == 0.0 and m['amplitude_vs_optimal'] == float('inf')
+    print('  collapsed model: rho=0, ceiling=0, skill=0 -- distinguishable')
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         cells = os.path.join(td, 'cells.parquet.zstd')
@@ -108,6 +132,8 @@ def main():
         assert len({d1, d2, d3}) == 3, (d1, d2, d3)
         print('run_dir separates latent and split configurations')
 
+    print('displacement decomposition:')
+    check_displacement_identity()
     print('\nnested-split pipeline smoke test passed')
 
 
