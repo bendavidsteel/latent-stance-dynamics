@@ -14,8 +14,11 @@
 # GPFA parameters are discrete so that trials sharing a latent configuration
 # hit the on-disk cache and only pay for landscape training.
 #
-#   wandb sweep config/sweep_joint.yaml
-#   wandb agent <entity>/potential_landscape_training/<sweep_id>
+#   wandb sweep --project potential_landscape_training scripts/sweeps/joint.yaml
+#   PATH=scripts/flows/.venv/bin:$PATH wandb agent <entity>/<project>/<sweep_id>
+#
+# The agent runs `python` through /usr/bin/env, which does not inherit the
+# venv unless it is on PATH -- without that every trial dies before it starts.
 
 program: scripts/flows/nn_potential.py
 method: bayes
