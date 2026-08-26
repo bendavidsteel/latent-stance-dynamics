@@ -34,9 +34,10 @@ parameters:
   # Only the objective horizon is scored: integrating the SDE over 90 days
   # costs about ten times a single step, so extra horizons are for final runs.
   eval_horizons:
-    value: [90]
+    value: "[90]"
   breakdown_scenario:
-    value: null
+    value: "null"
+
 
   # --- latent-GP factor model ---
   n_dims:
@@ -72,10 +73,6 @@ parameters:
     min: 0.0
     max: 0.2
   phi_hidden_dims:
-    values: [[64, 64, 64], [128, 128, 128, 128], [256, 256, 256]]
+    values: ["[64,64,64]", "[128,128,128,128]", "[256,256,256]"]
   batch_size:
     values: [256, 512, 1024]
-
-early_terminate:
-  type: hyperband
-  min_iter: 20
