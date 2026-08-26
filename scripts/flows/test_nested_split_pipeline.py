@@ -109,12 +109,13 @@ def main():
         assert np.array_equal(a, b), 'cached latents differ from the fitted ones'
         print('latent cache round-trips exactly')
 
-        # the landscape path must stay float32 even though latent_gp turns on x64
+        # df_to_data bounds its own memory; the loader promotes back to float64,
+        # which is the dtype evaluate_pairs must match
         assert jax.config.jax_enable_x64, 'latent_gp should have enabled x64'
         sample = nnp.df_to_data(pairs.head(4))[0][0]
         for k in ('t0', 'x0', 't1', 'x1'):
             assert np.asarray(sample[k]).dtype == np.float32, (k, sample[k])
-        print('df_to_data emits float32 despite global x64')
+        print('df_to_data emits float32; loader promotes to', nnp.SOLVE_DTYPE.__name__)
 
         # apply_split's nested branch must agree with selecting the cell directly
         for scenario in ('val_out', 'test_out', 'val_in'):

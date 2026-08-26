@@ -46,6 +46,16 @@ class LatentConfig:
     interp_days: float = 0.0        # 0 = keep the native bin grid
     seed: int = 0
 
+    def __post_init__(self):
+        # A sweep passes fast_tau=40 where the default is 80.0, and hydra keeps
+        # it an int. The tag hashes the value's repr, so without coercion the
+        # same configuration keys two different cache entries and every trial
+        # refits from scratch.
+        for f in dataclasses.fields(self):
+            cast = {int: int, float: float, 'int': int, 'float': float}.get(f.type)
+            if cast is not None:
+                object.__setattr__(self, f.name, cast(getattr(self, f.name)))
+
     @property
     def tag(self):
         """Cache key: everything that changes the fitted latents."""

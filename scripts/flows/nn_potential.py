@@ -27,10 +27,14 @@ logger = logging.getLogger(__name__)
 INITIAL_DATE = datetime.datetime(2020, 1, 1)
 UNIT_DAYS = 365.25
 
-# The factor model needs float64 and turns on JAX's x64 when latent_gp is
-# imported. That is global, so the landscape side has to say float32 explicitly
-# or its solver silently runs in double precision.
+# NumpyLoader promotes whatever it is given back to float64, so this only
+# bounds the memory df_to_data hands over; the solver still runs in the dtype
+# the loader produces.
 LANDSCAPE_DTYPE = np.float32
+# Dtype the loader (and therefore the jitted step) actually sees. evaluate_pairs
+# bypasses the loader, so it has to match this or diffrax's internal buffers
+# and the inputs disagree.
+SOLVE_DTYPE = np.float64
 
 
 def df_to_data(df):
@@ -393,6 +397,46 @@ def scenario_subsets(cell, n_dims, seed_df, breakdowns):
     return subsets
 
 
+# Evaluation cost grows sublinearly in batch size -- 8x the pairs costs about
+# 2x the time -- so scoring a scenario in one large batch is far cheaper than
+# in many small ones. Grouping pairs by their (t0, t1) makes it worse, not
+# better, for the same reason: it produces many tiny solves.
+#
+# The solver's step sizes cannot be loosened after the fact: dt0, dt_min,
+# dt_max and vbt_tol are baked in when the model is constructed, and
+# overwriting the attributes leaves the solve bit-identical.
+
+
+def evaluate_pairs(model, frame, key, batch_size):
+    """Score (x0, x1) pairs in the largest batches the caller allows."""
+    model = eqx.tree_inference(model, True)
+    parts = {k: [] for k in ('model', 'base', 'pred', 'dot')}
+    x0 = np.stack(frame['x0'].to_numpy())[:, None, :]
+    x1 = np.stack(frame['x1'].to_numpy())[:, None, :]
+    t0 = frame['t0'].to_numpy()
+    t1 = frame['t1'].to_numpy()
+    for start in tqdm(range(0, len(frame), batch_size), desc="    Batches"):
+        sl = slice(start, start + batch_size)
+        key, subkey = jax.random.split(key)
+        out = _eval_batch(model, jnp.asarray(t0[sl]), jnp.asarray(t1[sl]),
+                          jnp.asarray(x0[sl]), jnp.asarray(x1[sl]), subkey)
+        for name, arr in zip(('model', 'base', 'pred', 'dot'), out):
+            parts[name].append(np.array(arr))
+    return tuple(np.concatenate(parts[k]) for k in ('model', 'base', 'pred', 'dot'))
+
+
+def subsample(cell, cfg):
+    """Cap a scenario cell so evaluation cost does not track trajectory count.
+
+    Drawn with a fixed seed so the estimate is a property of the model rather
+    than of which pairs were picked.
+    """
+    cap = cfg.get('eval_max_pairs') or 0
+    if cap and len(cell) > cap:
+        return cell.sample(n=cap, seed=cfg.split.seed)
+    return cell
+
+
 def evaluate_scenarios(model, labelled, cfg, key, n_dims, seed_df, prefix,
                        breakdown_scenario=None):
     """Score every scenario cell of the nested split and log it to wandb.
@@ -413,17 +457,15 @@ def evaluate_scenarios(model, labelled, cfg, key, n_dims, seed_df, prefix,
             if len(cell) == 0:
                 logger.info(f'  {prefix}/{name}: no pairs, skipping')
                 continue
+            cell = subsample(cell, cfg)
 
             for sub_name, sub in scenario_subsets(
                     cell, n_dims, seed_df, breakdowns=(name == breakdown_scenario)):
                 if len(sub) == 0:
                     continue
-                loader = NumpyLoader(
-                    LandscapeSimulationDataset(data=df_to_data(sub)),
-                    batch_size=min(cfg.eval_batch_size, len(sub)), shuffle=False)
                 key, subkey = jax.random.split(key)
-                metrics = compute_metrics(*evaluate_dataloader(
-                    model, loader, subkey, with_displacement=True))
+                metrics = compute_metrics(*evaluate_pairs(
+                    model, sub, subkey, cfg.eval_batch_size))
                 if sub_name == 'overall':
                     results[name] = metrics
                     logger.info(

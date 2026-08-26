@@ -49,3 +49,8 @@ objective_scenario: val_out
 objective_metric: skill_ceiling
 breakdown_scenario: null       # per-dimension/type breakdowns; off for sweeps
 eval_horizons: [30, 90, 180]
+
+# Scoring a scenario cell in full takes hours once the drift field is
+# non-trivial, and cost grows sublinearly in batch size, so each cell is capped
+# and scored in one batch. Set eval_max_pairs to 0 to score every pair.
+eval_max_pairs: 5000
