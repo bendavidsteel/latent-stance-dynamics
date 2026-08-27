@@ -17,6 +17,14 @@
 #   wandb sweep --project potential_landscape_training scripts/sweeps/joint.yaml
 #   PATH=scripts/flows/.venv/bin:$PATH wandb agent <entity>/<project>/<sweep_id>
 #
+# Two agents fit on one 24GB card (a trial holds about 9GB) and the workload is
+# partly launch bound -- one trial draws 215W of a 350W budget -- so running a
+# second raises throughput rather than just splitting it.
+#
+# Run scripts/sweeps/watchdog.sh alongside them. Some configurations drive the
+# solver into batches that take minutes each; one such trial ran five and a
+# half hours without finishing an epoch and blocked its agent the whole time.
+#
 # The agent runs `python` through /usr/bin/env, which does not inherit the
 # venv unless it is on PATH -- without that every trial dies before it starts.
 
@@ -28,6 +36,8 @@ metric:
 
 command:
   - ${env}
+  - timeout                     # a stalled trial must not block its agent
+  - "6000"
   - python
   - ${program}
   - ${args_no_hyphens}
