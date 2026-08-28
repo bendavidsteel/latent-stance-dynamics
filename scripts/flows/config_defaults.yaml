@@ -39,14 +39,15 @@ latents:
 # moves between consecutive points, so 1-step skill is measured where there is
 # almost no motion to predict. The horizon has to be fixed across the sweep,
 # not matched to each trial's own timescale.
-# skill_ceiling = rho^2, the best skill any rescaling of the fitted drift
-# field could reach. Skill itself goes to zero as the drift does, whatever the
-# model has learned, so a sweep on it cannot tell a collapsed configuration
-# from a merely unhelpful one -- and it discards models that have the direction
-# right and only the amplitude wrong, which is the easy half to fix.
+# ceiling_gain is the variance of the observed motion that the landscape
+# explains beyond a momentum rule -- predict the reverse of recent motion,
+# which reaches |rho| ~ 0.25 on these latents by itself. skill_ceiling alone
+# would reward a model for rediscovering that, and skill alone is worse still:
+# it goes to zero as the drift does, whatever the model has learned, so it
+# cannot tell a collapsed configuration from a merely unhelpful one.
 objective_prefix: horizon_90d
 objective_scenario: val_out
-objective_metric: skill_ceiling
+objective_metric: ceiling_gain
 breakdown_scenario: null       # per-dimension/type breakdowns; off for sweeps
 eval_horizons: [30, 90, 180]
 

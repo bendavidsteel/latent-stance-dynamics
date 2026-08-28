@@ -88,7 +88,8 @@ def build_horizon_pairs(rolling_df, horizon_days, dims, tolerance_frac=0.25):
         .with_columns(
             [pl.col('t').shift(-shift_n).over('filter_value').alias('t1'),
              pl.col('createtime').shift(-shift_n).over('filter_value').alias('future_createtime')] + \
-            [pl.col(c).shift(-shift_n).over('filter_value').alias(f'x1_{i}') for c, i in zip(dim_cols, dims)]
+            [pl.col(c).shift(-shift_n).over('filter_value').alias(f'x1_{i}') for c, i in zip(dim_cols, dims)] + \
+            [pl.col(c).shift(shift_n).over('filter_value').alias(f'xm1_{i}') for c, i in zip(dim_cols, dims)]
         )\
         .drop_nulls(['t1'])\
         .with_columns(
@@ -101,9 +102,10 @@ def build_horizon_pairs(rolling_df, horizon_days, dims, tolerance_frac=0.25):
         .with_columns([
             pl.concat_arr(dim_cols).alias('x0'),
             pl.concat_arr([f'x1_{i}' for i in dims]).alias('x1'),
+            pl.concat_arr([f'xm1_{i}' for i in dims]).alias('xm1'),
         ])\
         .rename({'t': 't0'})\
-        .select(['t0', 'x0', 't1', 'x1', 'filter_value', 'createtime',
+        .select(['t0', 'x0', 't1', 'x1', 'xm1', 'filter_value', 'createtime',
                  'future_createtime'])
 
     return paired
@@ -155,14 +157,17 @@ def build_training_pairs(cfg, target_df, smooth=True, max_step_days=10):
         .with_columns(
             [pl.col('t0').shift(-1).over('filter_value').alias('t1'),
              pl.col('createtime').shift(-1).over('filter_value').alias('next_createtime')] + \
-            [pl.col(f'x0_{i}').shift(-1).over('filter_value').alias(f'x1_{i}') for i in range(n_dims)]
+            [pl.col(f'x0_{i}').shift(-1).over('filter_value').alias(f'x1_{i}') for i in range(n_dims)] + \
+            [pl.col(f'x0_{i}').shift(1).over('filter_value').alias(f'xm1_{i}') for i in range(n_dims)]
         )\
         .drop_nulls([f'x0_{i}' for i in range(n_dims)] + [f'x1_{i}' for i in range(n_dims)])\
         .with_columns([
             pl.concat_arr([f'x0_{i}' for i in range(n_dims)]).alias('x0'),
             pl.concat_arr([f'x1_{i}' for i in range(n_dims)]).alias('x1'),
+            pl.concat_arr([f'xm1_{i}' for i in range(n_dims)]).alias('xm1'),
         ])\
-        .select(['t0', 'x0', 't1', 'x1', 'filter_value', 'createtime', 'next_createtime'])\
+        .select(['t0', 'x0', 't1', 'x1', 'xm1', 'filter_value', 'createtime',
+                 'next_createtime'])\
         .with_columns(
             (pl.col('next_createtime') - pl.col('createtime')).alias('timestep'),
         )\
@@ -320,7 +325,8 @@ def load_seed_metadata(cfg):
     ]).unique('SeedName')
 
 
-def compute_metrics(model_losses, baseline_losses, pred_losses=None, dots=None):
+def compute_metrics(model_losses, baseline_losses, pred_losses=None, dots=None,
+                    mom_losses=None, dots_dm=None, dots_pm=None):
     """Evaluation metrics from per-sample losses, mean and median based.
 
     The mean ratio is dominated by the minority of pairs with a near-zero
@@ -371,6 +377,29 @@ def compute_metrics(model_losses, baseline_losses, pred_losses=None, dots=None):
         # 1.0 means the drift is already scaled the way the correlation warrants
         'amplitude_vs_optimal': float(ratio / rho) if rho > 0 else float('inf'),
     })
+    if mom_losses is None or dots_dm is None or dots_pm is None:
+        return out
+
+    # Momentum predicts the reverse of recent motion. On these latents it
+    # reaches |rho| ~ 0.25 on its own, so a model scored only against
+    # no-movement can look predictive while adding nothing a single line of
+    # numpy does not already give.
+    m2 = float(np.mean(mom_losses))
+    rho_dm = float(np.mean(dots_dm)) / np.sqrt(d2 * m2) if d2 > 0 and m2 > 0 else 0.0
+    rho_pm = float(np.mean(dots_pm)) / np.sqrt(p2 * m2) if p2 > 0 and m2 > 0 else 0.0
+    # variance of the observed motion explained by the two predictors together
+    denom = 1.0 - rho_pm ** 2
+    combined = ((rho ** 2 + rho_dm ** 2 - 2 * rho * rho_dm * rho_pm) / denom
+                if denom > 1e-6 else max(rho ** 2, rho_dm ** 2))
+    combined = float(np.clip(combined, 0.0, 1.0))
+    out.update({
+        'momentum_rho': rho_dm,
+        'momentum_ceiling': rho_dm ** 2,
+        'model_vs_momentum_rho': rho_pm,
+        'combined_ceiling': combined,
+        # what the landscape adds over the one-liner; the sweep optimises this
+        'ceiling_gain': combined - rho_dm ** 2,
+    })
     return out
 
 
@@ -410,19 +439,22 @@ def scenario_subsets(cell, n_dims, seed_df, breakdowns):
 def evaluate_pairs(model, frame, key, batch_size):
     """Score (x0, x1) pairs in the largest batches the caller allows."""
     model = eqx.tree_inference(model, True)
-    parts = {k: [] for k in ('model', 'base', 'pred', 'dot')}
+    names = ('model', 'base', 'pred', 'dot', 'mom', 'dot_dm', 'dot_pm')
+    parts = {k: [] for k in names}
     x0 = np.stack(frame['x0'].to_numpy())[:, None, :]
     x1 = np.stack(frame['x1'].to_numpy())[:, None, :]
+    xm1 = np.stack(frame['xm1'].to_numpy())[:, None, :]
     t0 = frame['t0'].to_numpy()
     t1 = frame['t1'].to_numpy()
     for start in tqdm(range(0, len(frame), batch_size), desc="    Batches"):
         sl = slice(start, start + batch_size)
         key, subkey = jax.random.split(key)
         out = _eval_batch(model, jnp.asarray(t0[sl]), jnp.asarray(t1[sl]),
-                          jnp.asarray(x0[sl]), jnp.asarray(x1[sl]), subkey)
-        for name, arr in zip(('model', 'base', 'pred', 'dot'), out):
+                          jnp.asarray(x0[sl]), jnp.asarray(x1[sl]), subkey,
+                          jnp.asarray(xm1[sl]))
+        for name, arr in zip(names, out):
             parts[name].append(np.array(arr))
-    return tuple(np.concatenate(parts[k]) for k in ('model', 'base', 'pred', 'dot'))
+    return tuple(np.concatenate(parts[k]) for k in names)
 
 
 def subsample(cell, cfg):
@@ -457,7 +489,7 @@ def evaluate_scenarios(model, labelled, cfg, key, n_dims, seed_df, prefix,
             if len(cell) == 0:
                 logger.info(f'  {prefix}/{name}: no pairs, skipping')
                 continue
-            cell = subsample(cell, cfg)
+            cell = subsample(cell.filter(pl.col('xm1').is_not_null()), cfg)
 
             for sub_name, sub in scenario_subsets(
                     cell, n_dims, seed_df, breakdowns=(name == breakdown_scenario)):
@@ -469,7 +501,9 @@ def evaluate_scenarios(model, labelled, cfg, key, n_dims, seed_df, prefix,
                 if sub_name == 'overall':
                     results[name] = metrics
                     logger.info(
-                        f"  {prefix}/{name}: ceiling={metrics['skill_ceiling']:.5f} "
+                        f"  {prefix}/{name}: gain={metrics.get('ceiling_gain', 0):.5f} "
+                        f"ceiling={metrics['skill_ceiling']:.5f} "
+                        f"mom={metrics.get('momentum_ceiling', 0):.5f} "
                         f"rho={metrics['direction_rho']:+.4f} "
                         f"R={metrics['displacement_ratio']:.5f} "
                         f"skill={metrics['skill_score']:+.5f} "
@@ -510,21 +544,29 @@ def compute_per_sample_mse(y_pred, y_true):
 
 
 @eqx.filter_jit
-def _eval_batch(model, t0, t1, y0, y1, key):
+def _eval_batch(model, t0, t1, y0, y1, key, ym1=None):
     """JIT-compiled evaluation of a single batch.
 
-    d.p is accumulated directly rather than recovered from the three squared
+    Cross-moments are accumulated directly rather than recovered from squared
     norms: in float32 those differ by far less than their own magnitude, so the
     subtraction would keep almost none of its precision.
+
+    m = -(y0 - ym1) is the momentum rule, which predicts the reverse of the
+    trajectory's own recent motion. Its moments travel alongside the model's so
+    that compute_metrics can ask what the landscape adds beyond it.
     """
     y_pred = model(t0, t1, y0, key)
     p = y_pred - y0
     d = y1 - y0
-    model_mse = compute_per_sample_mse(y_pred, y1)
-    baseline_mse = compute_per_sample_mse(y0, y1)
-    pred_mse = jnp.sum(jnp.square(p), axis=(-2, -1))
-    dot = jnp.sum(d * p, axis=(-2, -1))
-    return model_mse, baseline_mse, pred_mse, dot
+    m = jnp.zeros_like(p) if ym1 is None else -(y0 - ym1)
+    axes = (-2, -1)
+    return (compute_per_sample_mse(y_pred, y1),
+            compute_per_sample_mse(y0, y1),
+            jnp.sum(jnp.square(p), axis=axes),
+            jnp.sum(d * p, axis=axes),
+            jnp.sum(jnp.square(m), axis=axes),
+            jnp.sum(d * m, axis=axes),
+            jnp.sum(p * m, axis=axes))
 
 
 def evaluate_dataloader(model, dataloader, key, with_displacement=False):
@@ -546,7 +588,7 @@ def evaluate_dataloader(model, dataloader, key, with_displacement=False):
 
         key, subkey = jax.random.split(key)
         model_mse, baseline_mse, pred_mse, dot = _eval_batch(
-            inference_model, t0, t1, y0, y1, subkey)
+            inference_model, t0, t1, y0, y1, subkey)[:4]
 
         model_losses.append(np.array(model_mse))
         baseline_losses.append(np.array(baseline_mse))

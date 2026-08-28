@@ -67,6 +67,24 @@ def check_displacement_identity():
         print(f'  alpha={alpha:<4} rho={rho:+.4f} R={R:.4f} '
               f'skill={m["skill_score"]:+.5f} ceiling={m["skill_ceiling"]:.5f}')
 
+    # a model that only rediscovers the momentum rule must show no gain
+    m = rng.normal(size=(n, K))
+    d2 = 0.4 * m + rng.normal(size=(n, K))
+    for label, p, want_gain in (
+            ('model == momentum', m.copy(), False),
+            ('model is momentum rescaled', 3.0 * m, False),
+            ('model adds an orthogonal signal', 0.4 * d2 + 0.1 * m, True)):
+        met = nnp.compute_metrics(
+            ((d2 - p) ** 2).sum(1), (d2 ** 2).sum(1), (p ** 2).sum(1), (d2 * p).sum(1),
+            (m ** 2).sum(1), (d2 * m).sum(1), (p * m).sum(1))
+        gain = met['ceiling_gain']
+        print(f"  {label:32} mom_rho={met['momentum_rho']:+.3f} "
+              f"ceiling={met['skill_ceiling']:.4f} gain={gain:.4f}")
+        if want_gain:
+            assert gain > 0.05, (label, met)
+        else:
+            assert gain < 1e-6, (label, met)
+
     # a fully collapsed model must read as collapsed, not as merely unhelpful
     m = nnp.compute_metrics((d ** 2).sum(1), (d ** 2).sum(1),
                             np.zeros(n), np.zeros(n))
