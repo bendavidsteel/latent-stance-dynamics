@@ -103,10 +103,11 @@ def build_horizon_pairs(rolling_df, horizon_days, dims, tolerance_frac=0.25):
             pl.concat_arr(dim_cols).alias('x0'),
             pl.concat_arr([f'x1_{i}' for i in dims]).alias('x1'),
             pl.concat_arr([f'xm1_{i}' for i in dims]).alias('xm1'),
+            pl.col(f'xm1_{dims[0]}').is_not_null().alias('has_prev'),
         ])\
         .rename({'t': 't0'})\
-        .select(['t0', 'x0', 't1', 'x1', 'xm1', 'filter_value', 'createtime',
-                 'future_createtime'])
+        .select(['t0', 'x0', 't1', 'x1', 'xm1', 'has_prev', 'filter_value',
+                 'createtime', 'future_createtime'])
 
     return paired
 
@@ -165,9 +166,10 @@ def build_training_pairs(cfg, target_df, smooth=True, max_step_days=10):
             pl.concat_arr([f'x0_{i}' for i in range(n_dims)]).alias('x0'),
             pl.concat_arr([f'x1_{i}' for i in range(n_dims)]).alias('x1'),
             pl.concat_arr([f'xm1_{i}' for i in range(n_dims)]).alias('xm1'),
+            pl.col('xm1_0').is_not_null().alias('has_prev'),
         ])\
-        .select(['t0', 'x0', 't1', 'x1', 'xm1', 'filter_value', 'createtime',
-                 'next_createtime'])\
+        .select(['t0', 'x0', 't1', 'x1', 'xm1', 'has_prev', 'filter_value',
+                 'createtime', 'next_createtime'])\
         .with_columns(
             (pl.col('next_createtime') - pl.col('createtime')).alias('timestep'),
         )\
@@ -384,9 +386,15 @@ def compute_metrics(model_losses, baseline_losses, pred_losses=None, dots=None,
     # reaches |rho| ~ 0.25 on its own, so a model scored only against
     # no-movement can look predictive while adding nothing a single line of
     # numpy does not already give.
-    m2 = float(np.mean(mom_losses))
-    rho_dm = float(np.mean(dots_dm)) / np.sqrt(d2 * m2) if d2 > 0 and m2 > 0 else 0.0
-    rho_pm = float(np.mean(dots_pm)) / np.sqrt(p2 * m2) if p2 > 0 and m2 > 0 else 0.0
+    m2, c_dm, c_pm = (float(np.mean(x)) for x in (mom_losses, dots_dm, dots_pm))
+    # Guarding these with `> 0` would read False for NaN and silently report a
+    # momentum baseline of exactly zero, which is indistinguishable from one
+    # that genuinely explains nothing.
+    if not all(np.isfinite(v) for v in (m2, c_dm, c_pm)):
+        raise ValueError('non-finite momentum moments: pairs without a '
+                         'predecessor reached the scorer')
+    rho_dm = c_dm / np.sqrt(d2 * m2) if d2 > 0 and m2 > 0 else 0.0
+    rho_pm = c_pm / np.sqrt(p2 * m2) if p2 > 0 and m2 > 0 else 0.0
     # variance of the observed motion explained by the two predictors together
     denom = 1.0 - rho_pm ** 2
     combined = ((rho ** 2 + rho_dm ** 2 - 2 * rho * rho_dm * rho_pm) / denom
@@ -489,7 +497,7 @@ def evaluate_scenarios(model, labelled, cfg, key, n_dims, seed_df, prefix,
             if len(cell) == 0:
                 logger.info(f'  {prefix}/{name}: no pairs, skipping')
                 continue
-            cell = subsample(cell.filter(pl.col('xm1').is_not_null()), cfg)
+            cell = subsample(cell.filter(pl.col('has_prev')), cfg)
 
             for sub_name, sub in scenario_subsets(
                     cell, n_dims, seed_df, breakdowns=(name == breakdown_scenario)):

@@ -127,6 +127,20 @@ def main():
         assert np.array_equal(a, b), 'cached latents differ from the fitted ones'
         print('latent cache round-trips exactly')
 
+        # the momentum baseline must actually carry data. concat_arr hides a
+        # null component as NaN inside a non-null array, so this checks the
+        # plumbing rather than the formula -- the formula passed while every
+        # scored batch was silently feeding NaN.
+        assert 'has_prev' in pairs.columns
+        kept = pairs.filter(pl.col('has_prev'))
+        assert 0 < len(kept) < len(pairs), (len(kept), len(pairs))
+        a = np.stack(kept['x0'].to_numpy())
+        b = np.stack(kept['xm1'].to_numpy())
+        assert np.isfinite(b).all(), 'NaN predecessor survived the has_prev filter'
+        assert np.abs(a - b).mean() > 1e-9, 'predecessor is identical to the state'
+        print(f'momentum inputs: {len(kept)}/{len(pairs)} pairs have a finite '
+              f'predecessor, mean |x0-xm1|={np.abs(a - b).mean():.4f}')
+
         # df_to_data bounds its own memory; the loader promotes back to float64,
         # which is the dtype evaluate_pairs must match
         assert jax.config.jax_enable_x64, 'latent_gp should have enabled x64'
