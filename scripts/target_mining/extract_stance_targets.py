@@ -1,6 +1,7 @@
 import datetime
 import gc
 import os
+import time
 import traceback as tb
 
 import hydra
@@ -11,6 +12,39 @@ from tqdm import tqdm
 from stancemining.main import StanceMining
 
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+
+OUT_COLUMNS = ['id', 'seed', 'createtime', 'platform', 'Document', 'ParentDocument', 'Targets', 'finetune_kwargs']
+
+# Instagram image OCR. ocr_mean_conf is a per-post mean over detected lines; below
+# this the text is mostly garbled glyphs. Counting only runs of letters rejects the
+# digit-and-punctuation noise ("0v 5 2 j 651 1 4") that a plain word count lets past.
+OCR_MIN_CONF = 0.75
+OCR_MIN_WORDS = 3
+OCR_WORD = r'[^\W\d_]{3,}'
+OCR_MAX_CHARS = 1000
+
+# A document with no letters gives the model nothing to read, and it answers with a
+# canned target list rather than an empty one, so those rows are dropped up front.
+MIN_DOC_LETTERS = 1
+
+# vLLM builds a fresh engine for every month, and that start-up occasionally loses a
+# race for GPU memory; without a retry the month is skipped and silently keeps stale targets.
+ENGINE_RETRIES = 3
+
+
+def _blank_to_null(df: pl.DataFrame, column: str):
+    """Column as an expression, blanks as null; a literal null if it isn't there."""
+    if column not in df.columns:
+        return pl.lit(None, dtype=pl.String)
+    e = pl.col(column).str.strip_chars()
+    return pl.when(e.str.len_chars() > 0).then(e).otherwise(None)
+
+
+def _joined_blank_to_null(df: pl.DataFrame, columns):
+    parts = [_blank_to_null(df, c) for c in columns]
+    joined = pl.concat_str(parts, separator=' ', ignore_nulls=True).str.strip_chars()
+    return pl.when(joined.str.len_chars() > 0).then(joined).otherwise(None)
+
 
 def add_dialogue_turn(df: pl.DataFrame):
     """
@@ -64,57 +98,87 @@ class PlatformHandler:
 
     def format_platform_data(self, df: pl.DataFrame, platform):
         if platform == 'tiktok':
-            # TODO format text with author
             df = df.with_columns(pl.col('video_id').cast(pl.UInt64))
-            df = df.filter(pl.col('transcripts').is_not_null())
-            unique_speaker_df = df.select([
-                'video_id', 
-                (pl.col('transcripts').struct.field('segments').list.eval(pl.col('').struct.field('speaker')).list.unique().list.len() > 1).alias('multiple_speakers')
-            ])
-            # get speaker indexs
-            df = df.with_columns(pl.col('transcripts').struct.field('segments'))\
-                .explode('segments')\
-                .with_columns(pl.col('segments').struct.unnest())\
-                .with_columns(pl.col('speaker').str.split('_').list.get(-1).cast(pl.UInt32).alias('speaker_index'))
-            # find cases where a speaker index is also the author of the video
-            df = df.join(self.tiktok_speaker_author_df, on=['video_id', 'speaker_index'])\
-                .with_columns([
-                    pl.when(pl.col('is_author'))\
-                    .then(pl.lit('author'))\
-                    .otherwise(pl.col('speaker'))\
-                    .alias('speaker'),
-                    pl.col('text').str.strip_chars()
+            # every video has a caption but only some have a transcript, so the
+            # transcript is assembled on its own and joined back on
+            meta_df = df.select(['video_id', 'createtime', 'seed', 'desc']).unique('video_id', keep='first')
+            spoken_df = df.filter(pl.col('transcripts').is_not_null())
+
+            transcript_df = pl.DataFrame(schema={'video_id': pl.UInt64, 'text': pl.String})
+            if len(spoken_df) > 0:
+                unique_speaker_df = spoken_df.select([
+                    'video_id',
+                    (pl.col('transcripts').struct.field('segments').list.eval(pl.col('').struct.field('speaker')).list.unique().list.len() > 1).alias('multiple_speakers')
                 ])
-            df = df.join(unique_speaker_df, on='video_id', how='left')
-            df = add_dialogue_turn(df)
-            # group speaker sections together 
-            df = df.sort(['video_id', 'start'])\
-                .group_by(['video_id', 'createtime', 'seed', 'multiple_speakers', 'dialogue_turn'], maintain_order=True)\
-                .agg([pl.col('text'), pl.col('start').min(), pl.col('is_author').first()])\
-                .with_columns(pl.col('text').list.join(' ').str.strip_chars())
-            
-            df = df.with_columns(
-                pl.when(pl.col('is_author') | ~pl.col('multiple_speakers'))\
-                    .then(pl.col('text'))\
-                    .otherwise(pl.format('"{}"', 'text'))\
-                    .alias('formatted_text')
-            )
-            # TODO fix dialogue formatting
-            df = df.sort(['video_id', 'start'])\
-                .group_by(['video_id', 'createtime', 'seed'], maintain_order=True)\
-                .agg(pl.col('formatted_text'))\
-                .with_columns(pl.col('formatted_text').list.join(' ').str.strip_chars().alias('text'))
+                # get speaker indexs
+                seg_df = spoken_df.with_columns(pl.col('transcripts').struct.field('segments'))\
+                    .explode('segments')\
+                    .with_columns(pl.col('segments').struct.unnest())\
+                    .with_columns(pl.col('speaker').str.split('_').list.get(-1).cast(pl.UInt32).alias('speaker_index'))
+                # find cases where a speaker index is also the author of the video
+                seg_df = seg_df.join(self.tiktok_speaker_author_df, on=['video_id', 'speaker_index'])\
+                    .with_columns([
+                        pl.when(pl.col('is_author'))\
+                        .then(pl.lit('author'))\
+                        .otherwise(pl.col('speaker'))\
+                        .alias('speaker'),
+                        pl.col('text').str.strip_chars()
+                    ])
+                seg_df = seg_df.join(unique_speaker_df, on='video_id', how='left')
+                seg_df = add_dialogue_turn(seg_df)
+                # group speaker sections together
+                seg_df = seg_df.sort(['video_id', 'start'])\
+                    .group_by(['video_id', 'multiple_speakers', 'dialogue_turn'], maintain_order=True)\
+                    .agg([pl.col('text'), pl.col('start').min(), pl.col('is_author').first()])\
+                    .with_columns(pl.col('text').list.join(' ').str.strip_chars())
+
+                seg_df = seg_df.with_columns(
+                    pl.when(pl.col('is_author') | ~pl.col('multiple_speakers'))\
+                        .then(pl.col('text'))\
+                        .otherwise(pl.format('"{}"', 'text'))\
+                        .alias('formatted_text')
+                )
+                # TODO fix dialogue formatting
+                if len(seg_df) > 0:
+                    transcript_df = seg_df.sort(['video_id', 'start'])\
+                        .group_by('video_id', maintain_order=True)\
+                        .agg(pl.col('formatted_text'))\
+                        .with_columns(pl.col('formatted_text').list.join(' ').str.strip_chars().alias('text'))\
+                        .select(['video_id', 'text'])
+
+            df = meta_df.join(transcript_df, on='video_id', how='left')
+            desc = pl.col('desc').str.strip_chars()
+            desc = pl.when(desc.str.len_chars() > 0).then(desc).otherwise(None)
+            spoken = pl.when(pl.col('text').str.len_chars() > 0).then(pl.col('text')).otherwise(None)
             df = df.with_columns([
                 pl.col('video_id').alias('id').cast(pl.String),
-                pl.col('text').alias('Document'), 
+                # caption first, then whatever was said in the video
+                pl.when(desc.is_not_null() & spoken.is_not_null())
+                    .then(pl.concat_str([desc, spoken], separator='\n'))
+                    .otherwise(pl.coalesce([desc, spoken]))
+                    .alias('Document'),
                 pl.lit(None).alias('ParentDocument'),
-                pl.col('createtime').str.to_datetime().dt.convert_time_zone('UTC'), 
+                pl.col('createtime').str.to_datetime().dt.convert_time_zone('UTC'),
                 pl.lit('tiktok').alias('platform')]
             )
         elif platform == 'instagram':
+            caption = pl.col('caption').struct.field('text').str.strip_chars()
+            caption = pl.when(caption.str.len_chars() > 0).then(caption).otherwise(None)
+            if 'ocr_text' in df.columns:
+                ocr = pl.when(pl.col('ocr_mean_conf') >= OCR_MIN_CONF)\
+                    .then(pl.col('ocr_text').str.replace_all(r'\s+', ' ').str.strip_chars())\
+                    .otherwise(None)
+                ocr = pl.when(ocr.str.count_matches(OCR_WORD) >= OCR_MIN_WORDS).then(ocr).otherwise(None)
+                ocr = ocr.str.slice(0, OCR_MAX_CHARS)
+            else:
+                ocr = pl.lit(None, dtype=pl.String)
             df = df.with_columns([
                 pl.lit(None).alias('ParentDocument'),
-                pl.col('caption').struct.field('text').alias('Document'), 
+                # a post can carry its whole message in the image, so OCR alone still counts
+                pl.when(caption.is_not_null() & ocr.is_not_null())
+                    .then(pl.concat_str([caption, ocr], separator='\n'))
+                    .otherwise(pl.coalesce([caption, ocr]))
+                    .alias('Document'),
                 pl.from_epoch(pl.col('taken_at')).dt.convert_time_zone('UTC').alias('createtime'), 
                 pl.lit('instagram').alias('platform')
             ])
@@ -155,27 +219,31 @@ class PlatformHandler:
                 pl.col('date').str.to_datetime(time_zone='UTC').alias('createtime'), 
                 pl.lit('twitter').alias('platform')
             ])
-            # TODO remove rt @user and urls
+            # replace_all, since a tweet can carry several links; the retweet prefix is
+            # anchored and case-insensitive because it is always literally "RT @user:"
             df = df.with_columns([
-                pl.col('Document').str.replace(r'https://t.co/\w+', 'URL').str.replace('rt @\w+', ''),
-                pl.col('ParentDocument').str.replace(r'https://t.co/\w+', 'URL').str.replace('rt @\w+', '')
+                pl.col(c).str.replace_all(r'https://t\.co/\w+', 'URL')
+                         .str.replace_all(r'(?i)^rt @\w+:?\s*', '')
+                         .str.strip_chars()
+                for c in ('Document', 'ParentDocument')
             ])
         elif platform == 'bluesky':
-            # TODO add reply.root content as multiple parent documents
-            try:
-                df = df.with_columns([
-                    pl.col('reply').struct.field('parent').struct.field('record').struct.field('text').alias('ParentDocument'),
-                    pl.col('text').alias('Document'),
-                    pl.col('date').str.to_datetime(time_zone='UTC').alias('createtime'),
-                    pl.lit('bluesky').alias('platform')
-                ])
-            except pl.exceptions.StructFieldNotFoundError:
-                df = df.with_columns([
-                    pl.lit(None).alias('ParentDocument'),
-                    pl.col('text').alias('Document'),
-                    pl.col('date').str.to_datetime(time_zone='UTC').alias('createtime'),
-                    pl.lit('bluesky').alias('platform')
-                ])
+            text = pl.col('text').str.strip_chars()
+            text = pl.when(text.str.len_chars() > 0).then(text).otherwise(None)
+            orig = _blank_to_null(df, 'original_post_text')
+            link = _joined_blank_to_null(df, ['embed_title', 'embed_description'])
+            parent = pl.lit(None, dtype=pl.String)
+            reply_dtype = df.schema.get('reply')
+            if isinstance(reply_dtype, pl.Struct) and 'parent' in reply_dtype.to_schema():
+                parent = pl.col('reply').struct.field('parent').struct.field('record').struct.field('text')
+            df = df.with_columns([
+                # a bare repost has no text of its own, so the reposted content is the document
+                pl.coalesce([text, orig, link]).alias('Document'),
+                # ...but when the post does have text, the quoted post is context, as on twitter
+                pl.coalesce([parent, pl.when(text.is_not_null()).then(orig)]).alias('ParentDocument'),
+                pl.col('date').str.to_datetime(time_zone='UTC').alias('createtime'),
+                pl.lit('bluesky').alias('platform')
+            ])
         else:
             raise NotImplementedError("Haven't implemented this platform")
         
@@ -183,15 +251,16 @@ class PlatformHandler:
     
     def get_platform_columns(self, platform):
         if platform == 'tiktok':
-            return ['video_id', 'createtime', 'seed', 'transcripts']
+            return ['video_id', 'createtime', 'seed', 'transcripts', 'desc']
         elif platform == 'instagram':
-            return ['caption', 'taken_at', 'seed', 'id']
+            return ['caption', 'taken_at', 'seed', 'id', 'ocr_text', 'ocr_mean_conf']
         elif platform == 'instagram-meta':
             return ['description', 'date', 'seed', 'id']
         elif platform == 'twitter':
             return ['id', 'inReplyToTweetId', 'quotedTweet', 'rawContent', 'date', 'seed']
         elif platform == 'bluesky':
-            return ['reply', 'text', 'date', 'seed', 'id']
+            return ['reply', 'text', 'date', 'seed', 'id',
+                    'original_post_text', 'embed_title', 'embed_description']
         else:
             raise NotImplementedError("Haven't implemented this platform")
 
@@ -203,7 +272,8 @@ def join_text(df: pl.DataFrame):
             .alias('AllText')
     )
 
-def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, save_path, platform_handler: PlatformHandler, finetune_kwargs, config):
+def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, save_path, platform_handler: PlatformHandler, finetune_kwargs, config, embedding_model=None):
+    date_str = '<unknown>'
     try:
         year = month_files_df['year'][0]
         month = month_files_df['month'][0]
@@ -218,12 +288,12 @@ def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, s
             file_paths = month_files_df.filter(pl.col('platform') == platform)\
                 .select(pl.format('{}/{}', pl.lit(dir_path), pl.col('file')).alias('file_path'))['file_path'].to_list()
             try:
-                platform_df = pl.read_parquet(file_paths, columns=platform_columns)
-            except:
+                platform_df = pl.read_parquet(file_paths, columns=platform_columns, missing_columns='insert')
+            except Exception:
                 dfs = []
                 for file_path in file_paths:
                     try:
-                        file_df = pl.read_parquet(file_path, columns=platform_columns)
+                        file_df = pl.read_parquet(file_path, columns=platform_columns, missing_columns='insert')
                         dfs.append(file_df)
                     except Exception as ex:
                         print(f"Error reading file {file_path} for platform {platform}: {ex}")
@@ -247,29 +317,40 @@ def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, s
         df = join_text(df)
 
         # filter to politicians and influencers
-        df = df.filter(pl.col('AllText').is_not_null())
+        df = df.filter(pl.col('AllText').str.count_matches(r'[^\W\d_]') >= MIN_DOC_LETTERS)
 
         if len(df) == 0:
             return
 
-        # check if text already processed
+        # reuse the previous run's extractions wherever both the text and the
+        # extracting model are unchanged, so one file never mixes two models
         target_path = os.path.join(save_path, f'targets_{date_str}.parquet.zstd')
+        existing_df = None
         if os.path.exists(target_path):
             target_df = pl.read_parquet(target_path)
             if 'ParentDocument' not in target_df.columns:
-                target_df = target_df.with_columns(pl.lit(None).alias('ParentDocument'))
-            if 'AllText' not in target_df.columns:
-                target_df = join_text(target_df)
+                target_df = target_df.with_columns(pl.lit(None, dtype=pl.String).alias('ParentDocument'))
 
-            target_df = target_df.filter(pl.col('Targets').is_not_null())
+            reuse_df = target_df.filter(pl.col('Targets').is_not_null())\
+                .select([
+                    'id',
+                    'platform',
+                    pl.col('Document').alias('PriorDocument'),
+                    pl.col('ParentDocument').alias('PriorParentDocument'),
+                    'Targets',
+                    'finetune_kwargs'
+                ])\
+                .unique(['id', 'platform'])
 
-            df = df.join(target_df, on=['id', 'platform'], how='left')
-            existing_df = df.filter((pl.col('Document').fill_null('') == pl.col('Document_right').fill_null('')) & ((pl.col('ParentDocument').fill_null('') == pl.col('ParentDocument_right').fill_null(''))))\
-                .select(['id', 'seed', 'createtime', 'platform', 'Document', 'ParentDocument', 'Targets', 'finetune_kwargs'])
-            df = df.filter((pl.col('Document').fill_null('') != pl.col('Document_right').fill_null('')) | ((pl.col('ParentDocument').fill_null('') != pl.col('ParentDocument_right').fill_null(''))))\
-                .drop(['Document_right', 'ParentDocument_right', 'AllText_right'])
-        else:
-            existing_df = None
+            df = df.join(reuse_df, on=['id', 'platform'], how='left')
+            # eq_missing: null/null counts as unchanged, null/value does not
+            reused = pl.col('Targets').is_not_null()\
+                & pl.col('Document').eq_missing(pl.col('PriorDocument'))\
+                & pl.col('ParentDocument').eq_missing(pl.col('PriorParentDocument'))\
+                & (pl.col('finetune_kwargs').struct.field('model_path') == finetune_kwargs['model_path'])
+            existing_df = df.filter(reused).select(OUT_COLUMNS)
+            df = df.filter(~reused).drop(['PriorDocument', 'PriorParentDocument', 'Targets', 'finetune_kwargs'])
+            print(f"{date_str}: reusing {len(existing_df)}, extracting from {len(df)}")
 
         unique_df = df.unique('AllText')
 
@@ -277,19 +358,31 @@ def process_month(month_files_df: pl.DataFrame, model: StanceMining, dir_path, s
             return
 
         docs = unique_df['AllText'].to_list()
+        for attempt in range(ENGINE_RETRIES):
+            try:
+                doc_df = model.get_base_targets(docs, embedding_model=embedding_model)
+                break
+            except Exception as ex:
+                if attempt == ENGINE_RETRIES - 1:
+                    raise
+                print(f'{date_str}: extraction attempt {attempt + 1} failed ({type(ex).__name__}: {ex}), retrying')
+                gc.collect()
+                torch.cuda.empty_cache()
+                time.sleep(30)
 
-        doc_df = model.get_base_targets(docs)
-
-        # filter out some targets
+        # key the results by text, so every document sharing an AllText keeps the extraction
         text_col = 'text' if 'text' in doc_df.columns else 'Document'
-        target_df = unique_df.select(['id', 'platform', 'Document', 'AllText']).join(doc_df.select([text_col, 'Targets']), left_on='AllText', right_on=text_col, how='left').drop('AllText')
-        target_df = target_df.with_columns(pl.lit(finetune_kwargs).alias('finetune_kwargs'))
+        target_df = doc_df.select([pl.col(text_col).alias('AllText'), 'Targets']).unique('AllText')
 
-        df = df.select(['id', 'seed', 'createtime', 'platform', 'Document', 'ParentDocument']).join(target_df.select(['id', 'platform', 'Targets', 'finetune_kwargs']), on=['id', 'platform'], how='left')
-        if existing_df is not None:
-            df = pl.concat([df, existing_df])
+        df = df.join(target_df, on='AllText', how='left')\
+            .with_columns(pl.lit(finetune_kwargs).alias('finetune_kwargs'))\
+            .select(OUT_COLUMNS)
+        if existing_df is not None and len(existing_df) > 0:
+            df = pl.concat([df, existing_df], how='vertical_relaxed')
 
-        df.write_parquet(target_path, compression='zstd')
+        # rename last so an interrupted write cannot destroy the previous run's targets
+        df.write_parquet(target_path + '.tmp', compression='zstd')
+        os.replace(target_path + '.tmp', target_path)
     except Exception as e:
         print(f"Error processing {date_str}: exc type: {type(e).__name__}, message: {str(e)}")
         print(f"Traceback: {tb.format_exc()}")
@@ -332,17 +425,29 @@ def main(config):
     platform_handler = PlatformHandler()
 
     model = StanceMining(
-        # target_extraction_model_kwargs={'enforce_eager': True},
         target_extraction_finetune_kwargs=finetune_kwargs,
+        target_extraction_model_kwargs={
+            # fraction of the whole card, so it has to leave room for the embedding
+            # engine's ~0.1 and for anything else sharing the GPU
+            'gpu_memory_utilization': float(config.get('gpu_memory_utilization', 0.85)),
+            'max_lora_rank': 8,
+            'max_num_seqs': int(config.get('max_num_seqs', 512)),
+        },
         stance_target_type=config.stance_target_type,
         verbose=True,
     )
-    # model = None
+    # built once and passed down; get_base_targets otherwise starts and discards
+    # an embedding engine for every month
+    embedding_model = model._get_embedding_model()
 
     # group by month
-    # file_df = file_df.filter((pl.col('year') <= 2024) & (pl.col('month') <= 10)) # remove
-    for month_files_df in file_df.sort(['year', 'month'], descending=True).partition_by(['year', 'month']):
-        process_month(month_files_df, model, dir_path, save_path, platform_handler, finetune_kwargs, config)
+    month_dfs = file_df.sort(['year', 'month'], descending=True).partition_by(['year', 'month'])
+    num_shards = int(config.get('num_shards', 1))
+    if num_shards > 1:
+        # each shard owns a disjoint set of months, so they never write the same file
+        month_dfs = month_dfs[int(config.get('shard', 0))::num_shards]
+    for month_files_df in month_dfs:
+        process_month(month_files_df, model, dir_path, save_path, platform_handler, finetune_kwargs, config, embedding_model)
 
 if __name__ == '__main__':
     main()

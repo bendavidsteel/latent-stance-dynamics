@@ -89,17 +89,26 @@ def bluesky_row(src):
         'date': src.get('date'),
         'text': src.get('text'),
         'reply': {'parent': {'record': {'text': _get(src, 'reply', 'parent', 'record', 'text')}}},
+        # a bare repost carries no text of its own; a quote post carries both
+        'original_post_text': src.get('original_post_text'),
+        'embed_title': _get(src, 'embed', 'external', 'title'),
+        'embed_description': _get(src, 'embed', 'external', 'description'),
         'seed': coerce_seed(src.get('seed')),
     }
 
 
 def instagram_row(src):
+    conf = src.get('ocr_mean_conf')
     return {
         'id': src.get('id'),
         'date': src.get('date'),
         'caption': {'text': _get(src, 'caption', 'text')},
         'taken_at': src.get('taken_at'),
         'seed': coerce_seed(src.get('seed')),
+        'ocr_text': src.get('ocr_text'),
+        'ocr_mean_conf': float(conf) if conf is not None else None,
+        'ocr_n_lines': src.get('ocr_n_lines'),
+        'ocr_n_images': src.get('ocr_n_images'),
     }
 
 
@@ -114,15 +123,24 @@ def instagram_meta_row(src):
 
 def tiktok_row(src):
     segments = _get(src, 'transcripts', 'segments')
+    embeds = src.get('speaker_embeddings')
     return {
-        'video_id': src.get('video_id'),
+        'video_id': src.get('id.keyword') or src.get('video_id'),
         'date': src.get('date'),
         'createtime': src.get('createtime'),
+        'desc': src.get('desc'),
+        'author_name': src.get('author_name'),
         'transcripts': {'segments': [
             {'start': float(s['start']) if s.get('start') is not None else None,
              'text': s.get('text'), 'speaker': s.get('speaker')}
             for s in segments
         ]} if segments else None,
+        # unmapped in Elasticsearch, so it only ever comes back through _source
+        'speaker_embeddings': [
+            {'speaker_index': e.get('speaker_index'),
+             'embedding': [float(x) for x in (e.get('embedding') or [])]}
+            for e in embeds
+        ] if embeds else None,
         'seed': coerce_seed(src.get('seed')),
     }
 
@@ -143,19 +161,24 @@ PLATFORMS = {
     },
     'bluesky': {
         'index': 'phh_bluesky',
-        'source': ['id', 'date', 'text', 'reply.parent.record.text', 'seed'],
+        'source': ['id', 'date', 'text', 'reply.parent.record.text', 'original_post_text',
+                   'embed.external.title', 'embed.external.description', 'seed'],
         'row': bluesky_row,
         'schema': {
             'id': pl.String,
             'date': pl.String,
             'text': pl.String,
             'reply': pl.Struct({'parent': pl.Struct({'record': pl.Struct({'text': pl.String})})}),
+            'original_post_text': pl.String,
+            'embed_title': pl.String,
+            'embed_description': pl.String,
             'seed': SEED_SCHEMA,
         },
     },
     'instagram': {
         'index': 'phh_instagram_scraper',
-        'source': ['id', 'date', 'caption.text', 'taken_at', 'seed'],
+        'source': ['id', 'date', 'caption.text', 'taken_at', 'seed',
+                   'ocr_text', 'ocr_mean_conf', 'ocr_n_lines', 'ocr_n_images'],
         'row': instagram_row,
         'schema': {
             'id': pl.String,
@@ -163,6 +186,10 @@ PLATFORMS = {
             'caption': pl.Struct({'text': pl.String}),
             'taken_at': pl.Int64,
             'seed': SEED_SCHEMA,
+            'ocr_text': pl.String,
+            'ocr_mean_conf': pl.Float64,
+            'ocr_n_lines': pl.Int64,
+            'ocr_n_images': pl.Int64,
         },
     },
     'instagram-meta': {
@@ -178,15 +205,21 @@ PLATFORMS = {
     },
     'tiktok': {
         'index': 'phh_tiktok_embed',
-        'source': ['video_id', 'date', 'createtime', 'transcripts.segments.start',
-                   'transcripts.segments.text', 'transcripts.segments.speaker', 'seed'],
+        'source': ['video_id', 'date', 'createtime', 'desc', 'author_name',
+                   'transcripts.segments.start', 'transcripts.segments.text',
+                   'transcripts.segments.speaker', 'speaker_embeddings', 'seed'],
+        'docvalues': ['id.keyword'],
         'row': tiktok_row,
         'schema': {
             'video_id': pl.String,
             'date': pl.String,
             'createtime': pl.String,
+            'desc': pl.String,
+            'author_name': pl.String,
             'transcripts': pl.Struct({'segments': pl.List(pl.Struct({
                 'start': pl.Float64, 'text': pl.String, 'speaker': pl.String}))}),
+            'speaker_embeddings': pl.List(pl.Struct({
+                'speaker_index': pl.Int64, 'embedding': pl.List(pl.Float32)})),
             'seed': SEED_SCHEMA,
         },
     },
@@ -249,21 +282,40 @@ class Elastic:
     def count(self, index, query):
         return self.search(index, {'size': 0, 'query': query})['hits']['total']
 
-    def collect(self, index, query, source, start_ms, end_ms, total):
+    def collect(self, index, query, source, start_ms, end_ms, total, docvalues=None):
         """Return every document in [start_ms, end_ms), halving the window until it fits one response."""
         if total == 0:
             return []
         if total <= WINDOW_LIMIT:
-            body = {'size': total, '_source': source, 'query': scope(query, start_ms, end_ms)}
-            return [hit['_source'] for hit in self.search(index, body)['hits']['hits']]
+            return self._page(index, query, source, start_ms, end_ms, total, docvalues)
         mid_ms = start_ms + (end_ms - start_ms) // 2
         if mid_ms <= start_ms or mid_ms >= end_ms:
             print(f'{index}: {total} docs share timestamp {start_ms}, keeping {WINDOW_LIMIT}')
-            body = {'size': WINDOW_LIMIT, '_source': source, 'query': scope(query, start_ms, end_ms)}
-            return [hit['_source'] for hit in self.search(index, body)['hits']['hits']]
+            return self._page(index, query, source, start_ms, end_ms, WINDOW_LIMIT, docvalues)
         left_total = self.count(index, scope(query, start_ms, mid_ms))
-        return (self.collect(index, query, source, start_ms, mid_ms, left_total)
-                + self.collect(index, query, source, mid_ms, end_ms, total - left_total))
+        return (self.collect(index, query, source, start_ms, mid_ms, left_total, docvalues)
+                + self.collect(index, query, source, mid_ms, end_ms, total - left_total, docvalues))
+
+    def _page(self, index, query, source, start_ms, end_ms, size, docvalues):
+        body = {'size': size, '_source': source, 'query': scope(query, start_ms, end_ms)}
+        if docvalues:
+            body['docvalue_fields'] = docvalues
+        return [merge_docvalues(hit) for hit in self.search(index, body)['hits']['hits']]
+
+
+def merge_docvalues(hit):
+    """Fold docvalue_fields into _source.
+
+    The Kibana proxy parses responses in JavaScript, so an id stored as a JSON
+    number loses precision past 2^53 (tiktok's 19-digit ids round to the nearest
+    representable double). Docvalues on the keyword sub-field come back as strings
+    and survive intact.
+    """
+    src = dict(hit.get('_source') or {})
+    for name, values in (hit.get('fields') or {}).items():
+        if values:
+            src[name] = values[0]
+    return src
 
 
 def epoch_ms(day):
@@ -276,7 +328,7 @@ def fetch_day(es, platform, day, out_dir, seed_filter):
     start_ms, end_ms = epoch_ms(day), epoch_ms(day + datetime.timedelta(days=1))
     query = SEED_QUERY if seed_filter else None
     total = es.count(spec['index'], scope(query, start_ms, end_ms))
-    sources = es.collect(spec['index'], query, spec['source'], start_ms, end_ms, total)
+    sources = es.collect(spec['index'], query, spec['source'], start_ms, end_ms, total, spec.get('docvalues'))
     rows = [spec['row'](src) for src in sources]
     df = pl.DataFrame(rows, schema=spec['schema'])
     # rename last so an interrupted run leaves no half-written file for the next run to skip

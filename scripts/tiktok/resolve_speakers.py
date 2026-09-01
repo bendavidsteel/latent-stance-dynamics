@@ -103,7 +103,7 @@ def main():
             new_cluster_id += 1
     speaker_embedding_df = speaker_embedding_df.with_columns(pl.Series('cluster', embed_clusters))
 
-    speaker_embedding_df = speaker_embedding_df.join(segment_df.unique(['video_id', 'speaker_index']).select(['video_id', 'speaker_index', 'start', 'end', 'speaker', 'text']), on=['video_id', 'speaker_index'], how='left')
+    speaker_embedding_df = speaker_embedding_df.join(segment_df.unique(['video_id', 'speaker_index']).select(['video_id', 'speaker_index', 'start', 'speaker', 'text']), on=['video_id', 'speaker_index'], how='left')
 
     # print details by author
     print("Details by author:")
