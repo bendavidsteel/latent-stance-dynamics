@@ -4,6 +4,8 @@
 # paste them into config/config.yaml on each machine.
 
 n_dims: 6
+num_epochs: 100
+patience: 10
 
 # Nested trajectory x time split. Trajectories are hashed into train/val/test;
 # a pair is out-of-time when its target t1 lands in the last holdout_days.

@@ -17,9 +17,10 @@
 #   wandb sweep --project potential_landscape_training scripts/sweeps/joint.yaml
 #   PATH=scripts/flows/.venv/bin:$PATH wandb agent <entity>/<project>/<sweep_id>
 #
-# Two agents fit on one 24GB card (a trial holds about 9GB) and the workload is
-# partly launch bound -- one trial draws 215W of a 350W budget -- so running a
-# second raises throughput rather than just splitting it.
+# Run ONE agent. Two on a card split its throughput rather than adding to it --
+# measured 203W with two trials against 215W with one -- so each runs at about
+# half speed, and against a per-trial wall-clock budget that turns healthy
+# trials into killed ones.
 #
 # Run scripts/sweeps/watchdog.sh alongside them. Some configurations drive the
 # solver into batches that take minutes each; one such trial ran five and a
@@ -37,7 +38,10 @@ metric:
 command:
   - ${env}
   - timeout                     # a stalled trial must not block its agent
-  - "6000"
+  # 100 epochs at ~76s, plus the latent fit and six scenario cells, is about
+  # 8600s. A budget under that kills healthy trials rather than stalled ones,
+  # which is what cost the previous sweep two thirds of its yield.
+  - "10800"
   - python
   - ${program}
   - ${args_no_hyphens}
@@ -46,6 +50,14 @@ parameters:
   # --- fixed for every trial ---
   # Only the objective horizon is scored: integrating the SDE over 90 days
   # costs about ten times a single step, so extra horizons are for final runs.
+  # num_epochs also sets the learning-rate decay horizon, so this is a change
+  # to the optimisation and not only a cap; trials from earlier sweeps, which
+  # decayed over 400 epochs, are not comparable. Every trial that finished
+  # early-stopped well inside 100.
+  num_epochs:
+    value: 100
+  patience:
+    value: 10
   eval_horizons:
     value: "[90]"
   breakdown_scenario:
