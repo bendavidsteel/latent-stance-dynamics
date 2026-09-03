@@ -12,9 +12,10 @@ import torch
 import transformers
 
 from stancemining.main import StanceMining
-from stancemining.utils import deduplicate_all_similar_targets, remove_doc_bad_targets
+from stancemining.utils import remove_doc_bad_targets
 
-from find_targets import filter_to_common_targets
+from find_targets import deduplicate_on_targets, filter_to_common_targets, normalize_spelling_variants
+from translate_targets import TRANSLATION_FILE, apply_translations
 
 def get_raw_file(filename, platform):
     raw_path = '~/repos/sitrep/data/digital_trace/raw_platforms'
@@ -23,6 +24,9 @@ def get_raw_file(filename, platform):
     raw_filename = f"{platform}_{date_str}.parquet.zstd"
     raw_day_df = pl.read_parquet(os.path.join(raw_path, raw_filename))
     return raw_day_df
+
+TRAILING_PUNCT = ',.:?!"\'“”‘’…'
+LEADING_PUNCT = '@#"\'“”‘’'
 
 EMOJI_REGEX = r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF]'
 
@@ -49,21 +53,35 @@ def main(config):
     document_df = document_df.filter(pl.col('createtime') >= start_date)
     logger.info(f'Filtered documents to {document_df.shape[0]} after {start_date_str}.')
 
+    translation_path = os.path.join(os.path.dirname(target_dir.rstrip('/')), TRANSLATION_FILE)
+    if os.path.exists(translation_path):
+        translation_df = pl.read_parquet(translation_path)
+        n_translated = translation_df.filter(pl.col('TargetEnglish').is_not_null()).height
+        document_df = apply_translations(document_df, translation_df)
+        logger.info(f'Applied {n_translated} target translations.')
+    else:
+        logger.warning(f'No target translations at {translation_path}; run translate_targets.py first.')
+
     document_df = document_df.with_columns(pl.col('Targets').list.eval(pl.element().str.replace(r'\s*\([^)]*\)', '')\
-                                                                       .str.strip_chars_end(',.:?!')\
-                                                                       .str.strip_chars_start('@#')\
+                                                                       .str.replace_all(EMOJI_REGEX, '')\
+                                                                       .str.strip_chars_end(TRAILING_PUNCT)\
+                                                                       .str.strip_chars_start(LEADING_PUNCT)\
                                                                        .str.replace(',.*', '')\
-                                                                       .str.replace(EMOJI_REGEX, '')\
                                                                        .str.replace('^rt @ ', '')\
                                                                        .str.replace('^rt@', '')\
                                                                        .str.strip_chars()))
+
+    n_before = document_df.select('Targets').explode('Targets').n_unique()
+    document_df = normalize_spelling_variants(document_df)
+    n_after = document_df.select('Targets').explode('Targets').n_unique()
+    logger.info(f'Spelling normalisation merged {n_before - n_after} targets, {n_after} remain.')
 
     # remove bad targets
     print(f"Before filtering bad targets, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets present.")
     document_df = remove_doc_bad_targets(document_df, config.stance_target_type)
     print(f"After filtering bad targets, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets remain.")
 
-    document_df = filter_to_common_targets(document_df, num_targets=3000000)
+    document_df = filter_to_common_targets(document_df, num_targets=int(config.get('num_common_targets', 3000000)))
     print(f"After filtering to common targets, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets remain.")
 
     model = StanceMining(
@@ -92,7 +110,7 @@ def main(config):
     logger.info(f"Before de-duplicating similar targets, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets present.")
     
     if document_df.select('Targets').explode('Targets').unique('Targets').shape[0] < 4000000:
-        document_df = deduplicate_all_similar_targets(document_df, model.embedding_model, config.stance_target_type, batch_size=3000000, minhash_threshold=0.5, max_embedding_distance=0.15)
+        document_df = deduplicate_on_targets(document_df, model.embedding_model, config.stance_target_type, batch_size=3000000, minhash_threshold=0.5, max_embedding_distance=0.15)
     else:
         minhash_threshold = 0.7
         max_embedding_distance = 0.15
@@ -106,11 +124,11 @@ def main(config):
                 for i in batch_idx:
                     logger.info(f"Processing batch {i // batch_size + 1}/{len(batch_idx)}")
                     batch = document_df.slice(i, batch_size)
-                    batch = deduplicate_all_similar_targets(batch, model.embedding_model, config.stance_target_type, batch_size=batch_size, minhash_threshold=minhash_threshold, max_embedding_distance=max_embedding_distance)
+                    batch = deduplicate_on_targets(batch, model.embedding_model, config.stance_target_type, batch_size=batch_size, minhash_threshold=minhash_threshold, max_embedding_distance=max_embedding_distance)
                     new_document_df = pl.concat([new_document_df, batch], how='diagonal_relaxed')
                 document_df = new_document_df
             else:
-                document_df = deduplicate_all_similar_targets(document_df, model.embedding_model, config.stance_target_type, batch_size=100000, minhash_threshold=minhash_threshold, max_embedding_distance=max_embedding_distance)
+                document_df = deduplicate_on_targets(document_df, model.embedding_model, config.stance_target_type, batch_size=100000, minhash_threshold=minhash_threshold, max_embedding_distance=max_embedding_distance)
             logger.info(f"After de-duplicating similar targets with minhash_threshold={minhash_threshold} and max_embedding_distance={max_embedding_distance}, {document_df.select('Targets').explode('Targets').unique('Targets').shape[0]} targets remain.")
             minhash_threshold -= 0.1
             minhash_threshold = max(minhash_threshold, 0.2)
